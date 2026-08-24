@@ -1,7 +1,7 @@
 // BotRotation 1.0.0 for Superfighters Deluxe 1.6.
 // Passive telemetry only: this script never changes players, objects, teams or rules.
 
-private const string SCRIPT_VERSION = "1.2.8";
+private const string SCRIPT_VERSION = "1.2.9";
 private const string SFD_BUILD = "24892602";
 // SFD shared-storage names must contain letters only and be at least 3 characters.
 private const string STORAGE_NAME = "CCC";
@@ -30,7 +30,7 @@ private const int MAX_SCENE_WINDOW_OBJECTS = 8;
 private const int MAX_HIGHRES_WINDOW_SAMPLES = 50;
 private const int SCENE_HIGHRES_RING_SAMPLES = 100;
 private const int SCENE_HIGHRES_BATCH_SAMPLES = 10;
-private const int OBJECT_DAMAGE_BATCH_SIZE = 10;
+private const int OBJECT_DAMAGE_BATCH_SIZE = 25;
 private const float SCENE_NEAR_PLAYER_RADIUS = 200f;
 private const float SCENE_TRANSPORT_AVG_BYTES_PER_SECOND = 24576f;
 private const float SCENE_TRANSPORT_BURST_BYTES = 262144f;
@@ -437,8 +437,7 @@ private void OnObjectDamage(IObject obj, ObjectDamageArgs args)
 {
     MarkSceneObject(obj.UniqueID);
     IPlayer sourcePlayer = args.IsPlayer ? Game.GetPlayer(args.SourceID) : null;
-    m_pendingObjectDamage.Add(ObjectJson(
-        Field("object", SceneObjectJson(obj)),
+    m_pendingObjectDamage.Add(ObjectDamageJson(obj,
         Field("damage", Number(args.Damage)), Field("damage_type", Quote(args.DamageType.ToString())),
         Field("source_id", args.SourceID.ToString()), Field("source_is_player", Bool(args.IsPlayer)),
         Field("source_player_session_id", Quote(SessionId(sourcePlayer))),
@@ -461,6 +460,20 @@ private void FlushObjectDamageBatches()
         m_pendingObjectDamage.RemoveRange(0, count);
         QueueEvent("object_damage_batch", "", ObjectJson(Field("records", records.ToString())));
     }
+}
+
+private string ObjectDamageJson(IObject obj, params string[] fields)
+{
+    Vector2 pos = obj.GetWorldPosition();
+    Vector2 velocity = obj.GetLinearVelocity();
+    List<string> values = new List<string>();
+    values.Add(Field("object_id", obj.UniqueID.ToString()));
+    values.Add(Field("x", Number(pos.X))); values.Add(Field("y", Number(pos.Y)));
+    values.Add(Field("vx", Number(velocity.X))); values.Add(Field("vy", Number(velocity.Y)));
+    values.Add(Field("health", Number(obj.GetHealth()))); values.Add(Field("max_health", Number(obj.GetMaxHealth())));
+    values.Add(Field("is_missile", Bool(obj.IsMissile)));
+    for (int i = 0; i < fields.Length; i++) values.Add(fields[i]);
+    return ObjectJson(values.ToArray());
 }
 
 private void OnObjectTerminated(IObject[] objects)

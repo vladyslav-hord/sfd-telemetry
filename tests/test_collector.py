@@ -180,7 +180,7 @@ class DatabaseTests(unittest.TestCase):
             try:
                 batch = parse_telemetry_line(event(1, "object_damage_batch", None, {"records": [
                     {"object": {"object_id": 44, "name": "Barrel"}, "damage": 8, "damage_type": "Melee", "source_is_player": True, "source_player_session_id": "a", "game_ms": 10},
-                    {"object": {"object_id": 45, "name": "Crate"}, "damage": 4, "damage_type": "Projectile", "source_id": 77, "game_ms": 20},
+                    {"object_id": 45, "x": 2, "y": 4, "health": 8, "damage": 4, "damage_type": "Projectile", "source_id": 77, "game_ms": 20},
                 ]}))
                 self.assertEqual(db.insert_batch([batch]), (1, 0))
                 rows = db.connection.execute("SELECT interaction_type,player_session_id,game_ms FROM scene_interactions ORDER BY game_ms").fetchall()
