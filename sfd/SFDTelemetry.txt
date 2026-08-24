@@ -1,7 +1,7 @@
 // BotRotation 1.0.0 for Superfighters Deluxe 1.6.
 // Passive telemetry only: this script never changes players, objects, teams or rules.
 
-private const string SCRIPT_VERSION = "1.2.6";
+private const string SCRIPT_VERSION = "1.2.7";
 private const string SFD_BUILD = "24892602";
 // SFD shared-storage names must contain letters only and be at least 3 characters.
 private const string STORAGE_NAME = "CCC";
@@ -21,6 +21,7 @@ private const int SCENE_DYNAMIC_INTERVAL_MS = 250;
 private const int SCENE_DYNAMIC_HEARTBEAT_MS = 2000;
 private const int SCENE_STATIONARY_HEARTBEAT_MS = 10000;
 private const int SCENE_WINDOW_COOLDOWN_MS = 500;
+private const int SCENE_HIGHRES_CAPTURE_COOLDOWN_MS = 5000;
 private const int MAX_TRACKED_OBJECTS = 512;
 private const int MAX_HIGHRES_OBJECTS = 64;
 private const int MAX_SCENE_FRAME_OBJECTS = 16;
@@ -57,6 +58,7 @@ private float m_lastPingMs;
 private float m_lastFlushMs;
 private float m_lastSceneMs;
 private float m_lastSceneWindowMs;
+private float m_lastSceneHighresCaptureMs;
 private long m_droppedEventCount;
 private long m_lastReportedDroppedCount;
 private long m_droppedLowPriorityEventCount;
@@ -596,7 +598,15 @@ private void QueueSceneWindow(string trigger, int focusObjectId)
     entities.Append(']');
     QueueEvent("scene_window_complete", "", ObjectJson(
         Field("trigger", Quote(trigger)), Field("coverage", "1"), Field("entities", entities.ToString())));
-    if (focusObjectId > 0) m_pendingSceneCaptures.Add(new SceneWindowCapture { ObjectId = focusObjectId, DumpAtMs = now + HIGHRES_POST_EVENT_MS, Trigger = trigger });
+    if (focusObjectId > 0 && now - m_lastSceneHighresCaptureMs >= SCENE_HIGHRES_CAPTURE_COOLDOWN_MS && m_pending.Count < MAX_PENDING_EVENTS * 3 / 4)
+    {
+        m_lastSceneHighresCaptureMs = now;
+        m_pendingSceneCaptures.Add(new SceneWindowCapture { ObjectId = focusObjectId, DumpAtMs = now + HIGHRES_POST_EVENT_MS, Trigger = trigger });
+    }
+    else if (focusObjectId > 0)
+    {
+        m_sceneWindowSuppressedCount++;
+    }
 }
 
 private void FlushSceneCaptures(float now)
