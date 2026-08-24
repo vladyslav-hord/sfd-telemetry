@@ -107,10 +107,14 @@ def scene_overview(conn, start: str, end: str) -> dict[str, Any]:
            FROM scene_interactions i LEFT JOIN scene_entities e ON e.scene_entity_id=i.target_entity_id
            WHERE i.utc_timestamp>=? AND i.utc_timestamp<?""", (start, end)
     ).fetchall()
-    categories, types, heatmap = Counter(), Counter(), Counter()
+    categories, types, heatmap, graph_edges, object_usage = Counter(), Counter(), Counter(), Counter(), Counter()
     for row in interactions:
         types[row["interaction_type"]] += 1
-        categories[object_category(row["name"])] += 1
+        category = object_category(row["name"])
+        categories[category] += 1
+        object_usage[(row["name"] or "unknown", category)] += 1
+        source = "player:" + row["player_session_id"] if row["player_session_id"] else "scene_source"
+        graph_edges[(source, row["interaction_type"], category)] += 1
         if row["x"] is not None and row["y"] is not None:
             heatmap[(round(float(row["x"]) / 50) * 50, round(float(row["y"]) / 50) * 50)] += 1
     episodes = [dict(row) for row in conn.execute(
@@ -120,9 +124,17 @@ def scene_overview(conn, start: str, end: str) -> dict[str, Any]:
            WHERE e.utc_timestamp>=? AND e.utc_timestamp<? ORDER BY e.utc_timestamp DESC LIMIT 200""", (start, end)
     )]
     barrels = _barrel_candidates(conn, start, end)
+    lifecycle = {row[0]: row[1] for row in conn.execute(
+        "SELECT event_type,COUNT(*) FROM events WHERE event_type IN ('object_created','object_terminated','projectile_created','projectile_hit','explosion_hit') AND utc_timestamp>=? AND utc_timestamp<? GROUP BY event_type", (start, end)
+    )}
+    samples = conn.execute("SELECT COUNT(*) FROM scene_samples s JOIN events e ON e.event_id=s.event_id WHERE e.utc_timestamp>=? AND e.utc_timestamp<?", (start, end)).fetchone()[0]
     return {
         "available": bool(interactions), "interactions_by_type": dict(types), "object_categories": dict(categories),
         "interaction_heatmap": [{"x": x, "y": y, "count": count} for (x, y), count in heatmap.most_common(500)],
+        "object_usage": [{"name": name, "category": category, "interactions": count} for (name, category), count in object_usage.most_common(50)],
+        "interaction_graph": [{"from": source, "relation": relation, "to": target, "count": count} for (source, relation, target), count in graph_edges.most_common(100)],
+        "lifecycle": lifecycle, "scene_samples": samples,
+        "environmental_damage": sum(count for kind, count in types.items() if kind in {"object_damage_player", "object_damage_explosion", "object_impact_object"}),
         "barrel_boost_candidates": barrels, "motifs": _motifs(conn, start, end), "episodes": episodes,
     }
 
@@ -156,4 +168,11 @@ def load_episode(conn, source_event_id: int) -> dict[str, Any] | None:
         "SELECT interaction_type,source_quality,player_session_id,target_entity_id,game_ms,x,y,damage FROM scene_interactions WHERE round_id=? AND game_ms BETWEEN ? AND ? ORDER BY game_ms",
         (window["round_id"], start_ms, end_ms),
     )]
-    return {"source_event_id": source_event_id, "round_id": window["round_id"], "trigger": window["trigger"], "trigger_game_ms": window["trigger_game_ms"], "coverage": window["coverage"], "utc_timestamp": window["utc_timestamp"], "entities": [dict(row) for row in entity_rows], "samples": samples, "players": players, "interactions": interactions, "limitations": ["States between samples are interpolated.", "Unobserved SFD physics collisions are not reconstructed."]}
+    explosions = []
+    for row in conn.execute("SELECT game_ms,data_json FROM events WHERE round_id=? AND event_type='explosion_hit' AND game_ms BETWEEN ? AND ? ORDER BY game_ms", (window["round_id"], start_ms, end_ms)):
+        try:
+            data = json.loads(row["data_json"])
+            explosions.append({"game_ms": row["game_ms"], "x": data.get("x"), "y": data.get("y"), "radius": data.get("radius"), "max_damage": data.get("max_damage")})
+        except (TypeError, json.JSONDecodeError):
+            continue
+    return {"source_event_id": source_event_id, "round_id": window["round_id"], "trigger": window["trigger"], "trigger_game_ms": window["trigger_game_ms"], "coverage": window["coverage"], "utc_timestamp": window["utc_timestamp"], "entities": [dict(row) for row in entity_rows], "samples": samples, "players": players, "interactions": interactions, "explosions": explosions, "limitations": ["States between samples are interpolated.", "Unobserved SFD physics collisions are not reconstructed."]}

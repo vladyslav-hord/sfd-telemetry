@@ -158,6 +158,21 @@ class DatabaseTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_object_damage_preserves_exact_player_source_link(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = TelemetryDB(Path(directory) / "damage.sqlite3", ROOT / "sql/schema.sql", ROOT / "sql/views.sql")
+            try:
+                damage = parse_telemetry_line(event(1, "object_damage", None, {
+                    "object": {"object_id": 44, "name": "Barrel", "x": 3, "y": 2},
+                    "damage": 8, "damage_type": "Melee", "source_id": 7,
+                    "source_is_player": True, "source_player_session_id": "attacker",
+                }))
+                self.assertEqual(db.insert_batch([damage]), (1, 0))
+                row = db.connection.execute("SELECT interaction_type,source_quality,player_session_id FROM scene_interactions").fetchone()
+                self.assertEqual(tuple(row), ("object_damage_player", "exact", "attacker"))
+            finally:
+                db.close()
+
 
 class CollectorTests(unittest.TestCase):
     def test_snapshot_replacement_restart_dedupe_and_gap(self) -> None:

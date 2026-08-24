@@ -1,7 +1,7 @@
 // BotRotation 1.0.0 for Superfighters Deluxe 1.6.
 // Passive telemetry only: this script never changes players, objects, teams or rules.
 
-private const string SCRIPT_VERSION = "1.2.3";
+private const string SCRIPT_VERSION = "1.2.4";
 private const string SFD_BUILD = "24892602";
 // SFD shared-storage names must contain letters only and be at least 3 characters.
 private const string STORAGE_NAME = "CCC";
@@ -28,6 +28,8 @@ private const int MAX_PROJECTILE_FRAME_SAMPLES = 8;
 private const int MAX_SCENE_WINDOW_OBJECTS = 8;
 private const int MAX_HIGHRES_WINDOW_SAMPLES = 50;
 private const float SCENE_NEAR_PLAYER_RADIUS = 200f;
+private const float SCENE_TRANSPORT_AVG_BYTES_PER_SECOND = 24576f;
+private const float SCENE_TRANSPORT_BURST_BYTES = 262144f;
 private static readonly bool ENABLE_CHAT = true;
 private static readonly bool ENABLE_INPUTS = true;
 private static readonly bool ENABLE_PROJECTILES = true;
@@ -58,6 +60,10 @@ private long m_lastReportedDroppedCount;
 private long m_droppedLowPriorityEventCount;
 private long m_sceneDroppedSampleCount;
 private long m_sceneWindowSuppressedCount;
+private float m_sceneTransportTokens;
+private float m_sceneTransportLastMs;
+private long m_sceneBytesSinceHealth;
+private float m_lastSceneHealthMs;
 private IScriptStorage m_transport;
 private List<string> m_pending = new List<string>();
 private List<string> m_pendingTypes = new List<string>();
@@ -65,6 +71,7 @@ private Dictionary<string, List<StatePoint>> m_ring = new Dictionary<string, Lis
 private Dictionary<string, float> m_lastHighresDump = new Dictionary<string, float>();
 private Dictionary<string, float> m_captureUntil = new Dictionary<string, float>();
 private Dictionary<int, SceneState> m_sceneStates = new Dictionary<int, SceneState>();
+private Dictionary<int, float> m_sceneCaptureUntil = new Dictionary<int, float>();
 
 private class PlayerSession
 {
@@ -106,6 +113,10 @@ public void OnStartup()
     m_lastGameOver = Game.IsGameOver;
     m_lastSuddenDeath = Game.SuddenDeathActive;
     m_sceneStates.Clear();
+    m_sceneCaptureUntil.Clear();
+    m_sceneTransportTokens = SCENE_TRANSPORT_BURST_BYTES;
+    m_sceneTransportLastMs = Game.TotalElapsedGameTime;
+    m_lastSceneHealthMs = Game.TotalElapsedGameTime;
     m_transport = Game.GetSharedStorage(STORAGE_NAME);
 
     Game.Events.StartUserJoinCallback(OnUserJoin);
@@ -191,6 +202,11 @@ private void OnTelemetryUpdate(float elapsed)
     {
         m_lastSceneMs = now;
         SampleSceneDynamics(now);
+    }
+    if (now - m_lastSceneHealthMs >= 60000f)
+    {
+        m_lastSceneHealthMs = now;
+        QueueHealth();
     }
     if (Game.IsGameOver && !m_lastGameOver) EndRound("game_over_transition");
     m_lastGameOver = Game.IsGameOver;
@@ -310,6 +326,7 @@ private void OnPlayerMeleeAction(IPlayer attacker, PlayerMeleeHitArg[] args)
     {
         if (i > 0) hits.Append(',');
         IPlayer victim = args[i].HitObject as IPlayer;
+        if (!args[i].IsPlayer) MarkSceneObject(args[i].ObjectID);
         hits.Append(ObjectJson(
             Field("object_id", args[i].ObjectID.ToString()),
             Field("is_player", Bool(args[i].IsPlayer)),
@@ -386,10 +403,13 @@ private void OnObjectCreated(IObject[] objects)
 
 private void OnObjectDamage(IObject obj, ObjectDamageArgs args)
 {
+    MarkSceneObject(obj.UniqueID);
+    IPlayer sourcePlayer = args.IsPlayer ? Game.GetPlayer(args.SourceID) : null;
     QueueEvent("object_damage", "", ObjectJson(
         Field("object", SceneObjectJson(obj)),
         Field("damage", Number(args.Damage)), Field("damage_type", Quote(args.DamageType.ToString())),
         Field("source_id", args.SourceID.ToString()), Field("source_is_player", Bool(args.IsPlayer)),
+        Field("source_player_session_id", Quote(SessionId(sourcePlayer))),
         Field("health_after", Number(obj.GetHealth()))));
     QueueSceneWindow("object_damage");
 }
@@ -426,7 +446,8 @@ private void SampleSceneDynamics(float now)
     IObject[] objects = Game.GetObjects<IObject>();
     StringBuilder changed = new StringBuilder("[");
     int added = 0;
-    for (int i = 0; i < objects.Length && i < MAX_TRACKED_OBJECTS; i++)
+    for (int pass = 0; pass < 2 && added < MAX_SCENE_FRAME_OBJECTS; pass++)
+    for (int i = 0; i < objects.Length && i < MAX_TRACKED_OBJECTS && added < MAX_SCENE_FRAME_OBJECTS; i++)
     {
         IObject obj = objects[i];
         if (obj == null || obj.IsRemoved) continue;
@@ -438,6 +459,7 @@ private void SampleSceneDynamics(float now)
         SceneState old;
         bool known = m_sceneStates.TryGetValue(obj.UniqueID, out old);
         bool moving = velocity.Length() >= 0.5f || Math.Abs(angular) >= 0.1f || obj.IsMissile;
+        if ((pass == 0) != IsScenePriority(obj, moving, now)) continue;
         float heartbeat = moving ? SCENE_DYNAMIC_HEARTBEAT_MS : SCENE_STATIONARY_HEARTBEAT_MS;
         bool changedState = !known || (pos - old.Position).Length() >= 0.25f ||
             (velocity - old.Velocity).Length() >= 0.5f || Math.Abs(angle - old.Angle) >= 0.05f ||
@@ -473,6 +495,23 @@ private void SampleSceneDynamics(float now)
     projectileFrames.Append(']');
     if (projectileCount > 0)
         QueueEvent("scene_frame_batch", "", ObjectJson(Field("entities", projectileFrames.ToString())));
+}
+
+private void MarkSceneObject(int objectId)
+{
+    if (objectId > 0) m_sceneCaptureUntil[objectId] = Game.TotalElapsedGameTime + HIGHRES_POST_EVENT_MS;
+}
+
+private bool IsScenePriority(IObject obj, bool moving, float now)
+{
+    float captureUntil;
+    if (m_sceneCaptureUntil.TryGetValue(obj.UniqueID, out captureUntil) && captureUntil >= now) return true;
+    if (obj.IsMissile) return true;
+    Vector2 position = obj.GetWorldPosition();
+    IPlayer[] players = Game.GetPlayers();
+    for (int i = 0; i < players.Length; i++)
+        if (players[i] != null && (players[i].GetWorldPosition() - position).Length() <= SCENE_NEAR_PLAYER_RADIUS) return true;
+    return moving;
 }
 
 private void QueueSceneWindow(string trigger)
@@ -544,6 +583,7 @@ private void OnProjectileHit(IProjectile projectile, ProjectileHitArgs args)
     IPlayer owner = Game.GetPlayer(projectile.OwnerPlayerID);
     IPlayer victim = args.IsPlayer ? Game.GetPlayer(args.HitObjectID) : null;
     string victimSession = SessionId(victim);
+    if (!args.IsPlayer) MarkSceneObject(args.HitObjectID);
     QueueEvent("projectile_hit", SessionId(owner), ObjectJson(
         Field("attacker_session_id", Quote(SessionId(owner))),
         Field("victim_session_id", Quote(victimSession)),
@@ -569,6 +609,7 @@ private void OnExplosionHit(ExplosionData explosion, ExplosionHitArg[] args)
         if (i > 0) hits.Append(',');
         IPlayer victim = args[i].HitObject as IPlayer;
         string victimSession = SessionId(victim);
+        if (!args[i].IsPlayer) MarkSceneObject(args[i].ObjectID);
         hits.Append(ObjectJson(
             Field("object_id", args[i].ObjectID.ToString()),
             Field("victim_session_id", Quote(victimSession)),
@@ -1033,8 +1074,11 @@ private void QueueHealth()
         Field("flush_interval_ms", STORAGE_FLUSH_INTERVAL_MS.ToString()),
         Field("scene_dropped_sample_count", m_sceneDroppedSampleCount.ToString()),
         Field("scene_window_suppressed_count", m_sceneWindowSuppressedCount.ToString()),
+        Field("scene_transport_tokens", Number(m_sceneTransportTokens)),
+        Field("scene_bytes_last_minute", m_sceneBytesSinceHealth.ToString()),
         Field("storage_slot", m_storageSlot.ToString())));
     m_lastReportedDroppedCount = m_droppedEventCount;
+    m_sceneBytesSinceHealth = 0;
 }
 
 private void QueueEvent(string type, string playerSessionId, string dataJson)
@@ -1052,6 +1096,11 @@ private void QueueEvent(string type, string playerSessionId, string dataJson)
         Field("round_ms", Number(Game.TotalElapsedGameTime - m_roundStartMs)),
         Field("data", dataJson));
     string raw = PREFIX + envelope;
+    if (IsLowPrioritySceneEvent(type) && !TrySpendSceneTransport(raw.Length))
+    {
+        m_sceneDroppedSampleCount++;
+        return;
+    }
     if (m_pending.Count >= MAX_PENDING_EVENTS)
     {
         int lowPriorityIndex = FindOldestLowPriorityEvent();
@@ -1068,10 +1117,34 @@ private void QueueEvent(string type, string playerSessionId, string dataJson)
             return;
         }
     }
+    if (IsSceneEvent(type)) m_sceneBytesSinceHealth += raw.Length;
     m_pending.Add(Convert.ToBase64String(Encoding.UTF8.GetBytes(raw)));
     m_pendingTypes.Add(type);
     if (VERBOSE_DEBUG && type != "state_sample" && type != "highres_state_sample")
         Game.WriteToConsole("SFDTelemetry " + type + " #" + sequence.ToString());
+}
+
+private bool IsLowPrioritySceneEvent(string type)
+{
+    return type == "scene_frame_batch";
+}
+
+private bool IsSceneEvent(string type)
+{
+    return type == "scene_manifest_batch" || type == "scene_frame_batch" || type == "scene_window_complete" ||
+        type == "object_created" || type == "object_damage" || type == "object_terminated" ||
+        type == "projectile_created" || type == "projectile_hit" || type == "explosion_hit" || type == "melee_action";
+}
+
+private bool TrySpendSceneTransport(int bytes)
+{
+    float now = Game.TotalElapsedGameTime;
+    float elapsed = Math.Max(0f, now - m_sceneTransportLastMs);
+    m_sceneTransportLastMs = now;
+    m_sceneTransportTokens = Math.Min(SCENE_TRANSPORT_BURST_BYTES, m_sceneTransportTokens + elapsed / 1000f * SCENE_TRANSPORT_AVG_BYTES_PER_SECOND);
+    if (bytes > m_sceneTransportTokens) return false;
+    m_sceneTransportTokens -= bytes;
+    return true;
 }
 
 private void FlushPending()
@@ -1090,7 +1163,9 @@ private bool IsCriticalEvent(string type)
 {
     return type == "player_damage" || type == "player_death" || type == "round_start" ||
         type == "round_end" || type == "user_join" || type == "user_leave" ||
-        type == "chat_message";
+        type == "chat_message" || type == "object_created" || type == "object_damage" ||
+        type == "object_terminated" || type == "projectile_created" || type == "projectile_hit" ||
+        type == "explosion_hit" || type == "melee_action" || type == "scene_window_complete";
 }
 
 private int FindOldestLowPriorityEvent()

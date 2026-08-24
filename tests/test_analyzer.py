@@ -76,6 +76,49 @@ class MetricsTests(unittest.TestCase):
             result = _barrel_candidates(conn, "2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z")
         self.assertEqual(result[0]["confidence"], "high")
 
+    def test_scene_detector_marks_missing_trajectory_insufficient(self):
+        with sqlite3.connect(":memory:") as conn:
+            conn.row_factory = sqlite3.Row
+            conn.executescript("""
+                CREATE TABLE scene_interactions(scene_interaction_id INTEGER,event_id INTEGER,round_id TEXT,game_ms REAL,player_session_id TEXT,target_entity_id INTEGER,interaction_type TEXT,utc_timestamp TEXT);
+                CREATE TABLE scene_entities(scene_entity_id INTEGER,name TEXT);
+                CREATE TABLE scene_samples(scene_entity_id INTEGER,round_id TEXT,game_ms REAL,velocity_x REAL,velocity_y REAL,x REAL,y REAL);
+                CREATE TABLE state_samples(player_session_id TEXT,round_id TEXT,game_ms REAL,velocity_x REAL,velocity_y REAL,x REAL,y REAL);
+            """)
+            conn.execute("INSERT INTO scene_entities VALUES(1,'OilBarrel01')")
+            conn.execute("INSERT INTO scene_interactions VALUES(1,10,'r',1000,'p',1,'player_kick_object','2026-08-01T00:00:01Z')")
+            result = _barrel_candidates(conn, "2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z")
+        self.assertEqual(result[0]["confidence"], "insufficient")
+
+    def test_stationary_barrel_kick_is_not_a_high_confidence_boost(self):
+        with sqlite3.connect(":memory:") as conn:
+            conn.row_factory = sqlite3.Row
+            conn.executescript("""
+                CREATE TABLE scene_interactions(scene_interaction_id INTEGER,event_id INTEGER,round_id TEXT,game_ms REAL,player_session_id TEXT,target_entity_id INTEGER,interaction_type TEXT,utc_timestamp TEXT);
+                CREATE TABLE scene_entities(scene_entity_id INTEGER,name TEXT);
+                CREATE TABLE scene_samples(scene_entity_id INTEGER,round_id TEXT,game_ms REAL,velocity_x REAL,velocity_y REAL,x REAL,y REAL);
+                CREATE TABLE state_samples(player_session_id TEXT,round_id TEXT,game_ms REAL,velocity_x REAL,velocity_y REAL,x REAL,y REAL);
+            """)
+            conn.execute("INSERT INTO scene_entities VALUES(1,'OilBarrel01')")
+            conn.execute("INSERT INTO scene_interactions VALUES(1,10,'r',1000,'p',1,'player_kick_object','2026-08-01T00:00:01Z')")
+            conn.executemany("INSERT INTO scene_samples VALUES(?,?,?,?,?,?,?)", [(1,'r',950,0,0,0,0),(1,'r',1050,0,0,0,0)])
+            conn.executemany("INSERT INTO state_samples VALUES(?,?,?,?,?,?,?)", [('p','r',950,0,0,0,0),('p','r',1500,0,0,0,0)])
+            result = _barrel_candidates(conn, "2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z")
+        self.assertEqual(result[0]["confidence"], "low")
+
+    def test_explosion_interaction_is_not_a_barrel_boost(self):
+        with sqlite3.connect(":memory:") as conn:
+            conn.row_factory = sqlite3.Row
+            conn.executescript("""
+                CREATE TABLE scene_interactions(scene_interaction_id INTEGER,event_id INTEGER,round_id TEXT,game_ms REAL,player_session_id TEXT,target_entity_id INTEGER,interaction_type TEXT,utc_timestamp TEXT);
+                CREATE TABLE scene_entities(scene_entity_id INTEGER,name TEXT);
+                CREATE TABLE scene_samples(scene_entity_id INTEGER,round_id TEXT,game_ms REAL,velocity_x REAL,velocity_y REAL,x REAL,y REAL);
+                CREATE TABLE state_samples(player_session_id TEXT,round_id TEXT,game_ms REAL,velocity_x REAL,velocity_y REAL,x REAL,y REAL);
+            """)
+            conn.execute("INSERT INTO scene_entities VALUES(1,'OilBarrel01')")
+            conn.execute("INSERT INTO scene_interactions VALUES(1,10,'r',1000,'p',1,'explosion_hit_object','2026-08-01T00:00:01Z')")
+            self.assertEqual(_barrel_candidates(conn, "2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z"), [])
+
     def test_scene_episode_missing_is_none(self):
         with sqlite3.connect(":memory:") as conn:
             conn.execute("CREATE TABLE scene_windows(source_event_id INTEGER,round_id TEXT,trigger_game_ms REAL,trigger TEXT,coverage REAL,entities_json TEXT)")

@@ -221,7 +221,9 @@ class TelemetryDB:
                 self.connection.execute("UPDATE scene_entities SET terminated_event_id=? WHERE scene_entity_id=?", (event_id, entity_id))
             if event_type == "object_damage":
                 interaction_type = self._object_damage_type(data)
-                self._insert_scene_interaction(event_id, e, interaction_type, "exact", e.get("player"), None, entity_id, None, data)
+                source_kind = "projectile" if interaction_type == "object_damage_projectile" else "object"
+                actor_id = None if data.get("source_is_player") else self._scene_entity(e, event_id, source_kind, data.get("source_id"), {})
+                self._insert_scene_interaction(event_id, e, interaction_type, "exact", data.get("source_player_session_id") or e.get("player"), actor_id, entity_id, None, data)
         elif event_type == "melee_action":
             self._store_combat_event(event_id, event_type, data, e)
             for hit in data.get("hits", []):
