@@ -1,7 +1,7 @@
 // BotRotation 1.0.0 for Superfighters Deluxe 1.6.
 // Passive telemetry only: this script never changes players, objects, teams or rules.
 
-private const string SCRIPT_VERSION = "1.2.5";
+private const string SCRIPT_VERSION = "1.2.6";
 private const string SFD_BUILD = "24892602";
 // SFD shared-storage names must contain letters only and be at least 3 characters.
 private const string STORAGE_NAME = "CCC";
@@ -75,6 +75,7 @@ private Dictionary<string, float> m_captureUntil = new Dictionary<string, float>
 private Dictionary<int, SceneState> m_sceneStates = new Dictionary<int, SceneState>();
 private Dictionary<int, float> m_sceneCaptureUntil = new Dictionary<int, float>();
 private Dictionary<int, List<ScenePoint>> m_sceneRing = new Dictionary<int, List<ScenePoint>>();
+private List<SceneWindowCapture> m_pendingSceneCaptures = new List<SceneWindowCapture>();
 
 private class PlayerSession
 {
@@ -108,6 +109,13 @@ private class ScenePoint
     public string Json;
 }
 
+private class SceneWindowCapture
+{
+    public int ObjectId;
+    public float DumpAtMs;
+    public string Trigger;
+}
+
 public void OnStartup()
 {
     if (string.IsNullOrEmpty(s_serverSessionId))
@@ -124,6 +132,7 @@ public void OnStartup()
     m_sceneStates.Clear();
     m_sceneCaptureUntil.Clear();
     m_sceneRing.Clear();
+    m_pendingSceneCaptures.Clear();
     m_sceneTransportTokens = SCENE_TRANSPORT_BURST_BYTES;
     m_sceneTransportLastMs = Game.TotalElapsedGameTime;
     m_lastSceneHealthMs = Game.TotalElapsedGameTime;
@@ -198,6 +207,7 @@ private void OnTelemetryUpdate(float elapsed)
         m_lastHighresMs = now;
         SampleStates(now);
         SampleSceneRing(now);
+        FlushSceneCaptures(now);
     }
     if (now - m_lastBaselineMs >= BASELINE_STATE_INTERVAL_MS)
     {
@@ -586,7 +596,18 @@ private void QueueSceneWindow(string trigger, int focusObjectId)
     entities.Append(']');
     QueueEvent("scene_window_complete", "", ObjectJson(
         Field("trigger", Quote(trigger)), Field("coverage", "1"), Field("entities", entities.ToString())));
-    if (focusObjectId > 0) DumpSceneRing(focusObjectId, trigger);
+    if (focusObjectId > 0) m_pendingSceneCaptures.Add(new SceneWindowCapture { ObjectId = focusObjectId, DumpAtMs = now + HIGHRES_POST_EVENT_MS, Trigger = trigger });
+}
+
+private void FlushSceneCaptures(float now)
+{
+    for (int i = m_pendingSceneCaptures.Count - 1; i >= 0; i--)
+    {
+        SceneWindowCapture capture = m_pendingSceneCaptures[i];
+        if (now < capture.DumpAtMs) continue;
+        DumpSceneRing(capture.ObjectId, capture.Trigger);
+        m_pendingSceneCaptures.RemoveAt(i);
+    }
 }
 
 private void DumpSceneRing(int objectId, string trigger)
