@@ -1,0 +1,1144 @@
+// BotRotation 1.0.0 for Superfighters Deluxe 1.6.
+// Passive telemetry only: this script never changes players, objects, teams or rules.
+
+private const string SCRIPT_VERSION = "1.2.2";
+private const string SFD_BUILD = "24892602";
+// SFD shared-storage names must contain letters only and be at least 3 characters.
+private const string STORAGE_NAME = "CCC";
+private const string PREFIX = "SFDTELEMETRY_V1|";
+
+// Safe defaults for an 8-player public server.
+private const int BASELINE_STATE_INTERVAL_MS = 1000;
+private const int HIGHRES_STATE_INTERVAL_MS = 50;
+private const int HIGHRES_WINDOW_MS = 10000;
+private const int HIGHRES_POST_EVENT_MS = 2000;
+private const int PING_INTERVAL_MS = 5000;
+private const int STORAGE_FLUSH_INTERVAL_MS = 250;
+private const int STORAGE_SLOT_COUNT = 64;
+private const int MAX_EVENTS_PER_SLOT = 64;
+private const int MAX_PENDING_EVENTS = 2048;
+private const int SCENE_DYNAMIC_INTERVAL_MS = 250;
+private const int SCENE_DYNAMIC_HEARTBEAT_MS = 2000;
+private const int SCENE_STATIONARY_HEARTBEAT_MS = 10000;
+private const int SCENE_WINDOW_COOLDOWN_MS = 500;
+private const int MAX_TRACKED_OBJECTS = 512;
+private const int MAX_HIGHRES_OBJECTS = 64;
+private const int MAX_SCENE_FRAME_OBJECTS = 16;
+private const int MAX_SCENE_WINDOW_OBJECTS = 8;
+private const int MAX_HIGHRES_WINDOW_SAMPLES = 50;
+private const float SCENE_NEAR_PLAYER_RADIUS = 200f;
+private static readonly bool ENABLE_CHAT = true;
+private static readonly bool ENABLE_INPUTS = true;
+private static readonly bool ENABLE_PROJECTILES = true;
+private static readonly bool ENABLE_OBJECT_EVENTS = true;
+private static readonly bool ENABLE_SCENE_TELEMETRY = true;
+private static readonly bool ENABLE_WORLD_CONTEXT = false; // Context is reconstructed offline by default.
+private static readonly bool VERBOSE_DEBUG = false;
+
+private static string s_serverSessionId;
+private static long s_sequence;
+private static Dictionary<int, PlayerSession> s_sessions = new Dictionary<int, PlayerSession>();
+private static Dictionary<int, string> s_playerSessions = new Dictionary<int, string>();
+
+private string m_roundId;
+private float m_roundStartMs;
+private bool m_roundEnded;
+private bool m_lastGameOver;
+private bool m_lastSuddenDeath;
+private int m_storageSlot;
+private float m_lastBaselineMs;
+private float m_lastHighresMs;
+private float m_lastPingMs;
+private float m_lastFlushMs;
+private float m_lastSceneMs;
+private float m_lastSceneWindowMs;
+private long m_droppedEventCount;
+private long m_lastReportedDroppedCount;
+private long m_droppedLowPriorityEventCount;
+private long m_sceneDroppedSampleCount;
+private long m_sceneWindowSuppressedCount;
+private IScriptStorage m_transport;
+private List<string> m_pending = new List<string>();
+private List<string> m_pendingTypes = new List<string>();
+private Dictionary<string, List<StatePoint>> m_ring = new Dictionary<string, List<StatePoint>>();
+private Dictionary<string, float> m_lastHighresDump = new Dictionary<string, float>();
+private Dictionary<string, float> m_captureUntil = new Dictionary<string, float>();
+private Dictionary<int, SceneState> m_sceneStates = new Dictionary<int, SceneState>();
+
+private class PlayerSession
+{
+    public string Id;
+    public int UserIdentifier;
+    public DateTime JoinedUtc;
+    public string AccountName;
+    public string CharacterName;
+}
+
+private class StatePoint
+{
+    public float GameMs;
+    public string Json;
+}
+
+private class SceneState
+{
+    public Vector2 Position;
+    public Vector2 Velocity;
+    public float Angle;
+    public float AngularVelocity;
+    public float Health;
+    public bool Missile;
+    public float LastSavedMs;
+}
+
+public void OnStartup()
+{
+    if (string.IsNullOrEmpty(s_serverSessionId))
+    {
+        s_serverSessionId = Guid.NewGuid().ToString("D");
+        s_sequence = 0;
+        s_sessions.Clear();
+        s_playerSessions.Clear();
+    }
+    m_roundId = Guid.NewGuid().ToString("D");
+    m_roundStartMs = Game.TotalElapsedGameTime;
+    m_lastGameOver = Game.IsGameOver;
+    m_lastSuddenDeath = Game.SuddenDeathActive;
+    m_sceneStates.Clear();
+    m_transport = Game.GetSharedStorage(STORAGE_NAME);
+
+    Game.Events.StartUserJoinCallback(OnUserJoin);
+    Game.Events.StartUserLeaveCallback(OnUserLeave);
+    Game.Events.StartUserMessageCallback(OnUserMessage);
+    Game.Events.StartPlayerCreatedCallback(OnPlayerCreated);
+    Game.Events.StartPlayerDamageCallback(OnPlayerDamage);
+    Game.Events.StartPlayerDeathCallback(OnPlayerDeath);
+    Game.Events.StartPlayerMeleeActionCallback(OnPlayerMeleeAction);
+    Game.Events.StartPlayerWeaponAddedActionCallback(OnWeaponAdded);
+    Game.Events.StartPlayerWeaponRemovedActionCallback(OnWeaponRemoved);
+    if (ENABLE_INPUTS) Game.Events.StartPlayerKeyInputCallback(OnPlayerKeyInput);
+    if (ENABLE_PROJECTILES)
+    {
+        Game.Events.StartProjectileCreatedCallback(OnProjectileCreated);
+        Game.Events.StartProjectileHitCallback(OnProjectileHit);
+        Game.Events.StartExplosionHitCallback(OnExplosionHit);
+    }
+    if (ENABLE_OBJECT_EVENTS)
+    {
+        Game.Events.StartObjectCreatedCallback(OnObjectCreated);
+        Game.Events.StartObjectDamageCallback(OnObjectDamage);
+        Game.Events.StartObjectTerminatedCallback(OnObjectTerminated);
+    }
+    Game.Events.StartUpdateCallback(OnTelemetryUpdate, HIGHRES_STATE_INTERVAL_MS);
+
+    QueueEvent("script_start", "", ObjectJson(
+        Field("script_version", Quote(SCRIPT_VERSION)),
+        Field("sfd_build", Quote(SFD_BUILD)),
+        Field("transport", Quote("shared_storage_base64_spool")),
+        Field("map_name", Quote(Game.MapName)),
+        Field("config", ObjectJson(
+            Field("baseline_state_hz", Number(1000f / BASELINE_STATE_INTERVAL_MS)),
+            Field("highres_state_hz", Number(1000f / HIGHRES_STATE_INTERVAL_MS)),
+            Field("highres_window_seconds", Number(HIGHRES_WINDOW_MS / 1000f)),
+            Field("ping_interval_seconds", Number(PING_INTERVAL_MS / 1000f)),
+            Field("enable_chat", Bool(ENABLE_CHAT)),
+            Field("enable_inputs", Bool(ENABLE_INPUTS)),
+            Field("enable_projectiles", Bool(ENABLE_PROJECTILES)),
+            Field("enable_object_events", Bool(ENABLE_OBJECT_EVENTS)),
+            Field("enable_world_context", Bool(ENABLE_WORLD_CONTEXT)),
+            Field("verbose_debug", Bool(VERBOSE_DEBUG))))));
+
+    IUser[] users = Game.GetActiveUsers();
+    for (int i = 0; i < users.Length; i++) EnsureSession(users[i], "user_present");
+    QueueRoundStart();
+    QueueSceneManifest();
+    SnapshotAllStatistics("round_start");
+    ForceFlush();
+}
+
+public void OnShutdown()
+{
+    SnapshotAllStatistics("round_end");
+    EndRound("script_shutdown");
+    QueueHealth();
+    QueueEvent("script_shutdown", "", ObjectJson(
+        Field("map_name", Quote(Game.MapName)),
+        Field("map_round", Game.MapRound.ToString()),
+        Field("is_game_over", Bool(Game.IsGameOver))));
+    ForceFlush();
+}
+
+private void OnTelemetryUpdate(float elapsed)
+{
+    float now = Game.TotalElapsedGameTime;
+    if (now - m_lastHighresMs >= HIGHRES_STATE_INTERVAL_MS)
+    {
+        m_lastHighresMs = now;
+        SampleStates(now);
+    }
+    if (now - m_lastBaselineMs >= BASELINE_STATE_INTERVAL_MS)
+    {
+        m_lastBaselineMs = now;
+        PersistBaselineStates();
+    }
+    if (now - m_lastPingMs >= PING_INTERVAL_MS)
+    {
+        m_lastPingMs = now;
+        SamplePing();
+    }
+    if (ENABLE_SCENE_TELEMETRY && now - m_lastSceneMs >= SCENE_DYNAMIC_INTERVAL_MS)
+    {
+        m_lastSceneMs = now;
+        SampleSceneDynamics(now);
+    }
+    if (Game.IsGameOver && !m_lastGameOver) EndRound("game_over_transition");
+    m_lastGameOver = Game.IsGameOver;
+    if (Game.SuddenDeathActive != m_lastSuddenDeath)
+    {
+        m_lastSuddenDeath = Game.SuddenDeathActive;
+        QueueEvent("sudden_death_transition", "", ObjectJson(
+            Field("active", Bool(m_lastSuddenDeath)),
+            Field("enabled", Bool(Game.SuddenDeathEnabled))));
+    }
+    if (now - m_lastFlushMs >= STORAGE_FLUSH_INTERVAL_MS)
+    {
+        m_lastFlushMs = now;
+        FlushPending();
+    }
+}
+
+private void OnUserJoin(IUser[] users)
+{
+    for (int i = 0; i < users.Length; i++) EnsureSession(users[i], "user_join");
+}
+
+private void OnUserLeave(IUser[] users, DisconnectionType type)
+{
+    for (int i = 0; i < users.Length; i++)
+    {
+        IUser user = users[i];
+        PlayerSession session = GetSession(user);
+        if (session == null) session = CreateSession(user);
+        IPlayer player = user.GetPlayer();
+        if (player != null) SnapshotStatistics(player, "leave");
+        double durationMs = (DateTime.UtcNow - session.JoinedUtc).TotalMilliseconds;
+        QueueEvent("user_leave", session.Id, ObjectJson(
+            Field("reason", Quote(type.ToString())),
+            Field("duration_ms", Number(durationMs)),
+            Field("ping", user.Ping.ToString()),
+            Field("spectating", Bool(user.Spectating)),
+            Field("team", Quote(user.GetTeam().ToString())),
+            Field("total_games", user.TotalGames.ToString()),
+            Field("total_wins", user.TotalWins.ToString()),
+            Field("total_losses", user.TotalLosses.ToString()),
+            Field("state", player == null ? "null" : PlayerStateJson(player, 0))));
+        s_sessions.Remove(user.UserIdentifier);
+        if (player != null) s_playerSessions.Remove(player.UniqueID);
+        m_ring.Remove(session.Id);
+        m_captureUntil.Remove(session.Id);
+    }
+}
+
+private void OnUserMessage(UserMessageCallbackArgs args)
+{
+    if (!ENABLE_CHAT || args == null || args.User == null) return;
+    PlayerSession session = GetOrCreateSession(args.User);
+    IPlayer player = args.User.GetPlayer();
+    QueueEvent("chat_message", session.Id, ObjectJson(
+        Field("account_name", Quote(args.User.AccountName)),
+        Field("character_name", Quote(args.User.Name)),
+        Field("message", Quote(args.Message)),
+        Field("is_command", Bool(args.IsCommand)),
+        Field("command", Quote(args.Command)),
+        Field("command_arguments", Quote(args.CommandArguments)),
+        Field("map_name", Quote(Game.MapName)),
+        Field("player_count", Game.GetPlayers().Length.ToString()),
+        Field("team", Quote(args.User.GetTeam().ToString())),
+        Field("spectating", Bool(args.User.Spectating)),
+        Field("state", player == null ? "null" : PlayerStateJson(player, 0))));
+}
+
+private void OnPlayerCreated(IPlayer[] players)
+{
+    for (int i = 0; i < players.Length; i++)
+    {
+        IPlayer player = players[i];
+        string sessionId = SessionId(player);
+        QueueEvent("player_created", sessionId, PlayerContextJson(player));
+        SnapshotStatistics(player, "player_created");
+    }
+}
+
+private void OnPlayerDamage(IPlayer victim, PlayerDamageArgs args)
+{
+    IPlayer attacker = ResolveDamageAttacker(args);
+    string victimSession = SessionId(victim);
+    string attackerSession = SessionId(attacker);
+    float distance = Distance(attacker, victim);
+    QueueEvent("player_damage", victimSession, ObjectJson(
+        Field("victim_session_id", Quote(victimSession)),
+        Field("attacker_session_id", Quote(attackerSession)),
+        Field("damage", Number(args.Damage)),
+        Field("damage_type", Quote(args.DamageType.ToString())),
+        Field("source_id", args.SourceID.ToString()),
+        Field("overkill", Bool(args.OverkillDamage)),
+        Field("distance", distance < 0 ? "null" : Number(distance)),
+        Field("victim", PlayerContextJson(victim)),
+        Field("attacker", attacker == null ? "null" : PlayerContextJson(attacker))));
+    if (args.Damage >= 20f) TriggerHighres(victimSession, "large_damage");
+}
+
+private void OnPlayerDeath(IPlayer player, PlayerDeathArgs args)
+{
+    string sessionId = SessionId(player);
+    QueueEvent("player_death", sessionId, ObjectJson(
+        Field("victim_session_id", Quote(sessionId)),
+        Field("event", Quote(args.Event.ToString())),
+        Field("killed", Bool(args.Killed)),
+        Field("removed", Bool(args.Removed)),
+        Field("state", PlayerContextJson(player))));
+    SnapshotStatistics(player, "death");
+    TriggerHighres(sessionId, "death");
+}
+
+private void OnPlayerMeleeAction(IPlayer attacker, PlayerMeleeHitArg[] args)
+{
+    string attackerSession = SessionId(attacker);
+    StringBuilder hits = new StringBuilder("[");
+    for (int i = 0; i < args.Length; i++)
+    {
+        if (i > 0) hits.Append(',');
+        IPlayer victim = args[i].HitObject as IPlayer;
+        hits.Append(ObjectJson(
+            Field("object_id", args[i].ObjectID.ToString()),
+            Field("is_player", Bool(args[i].IsPlayer)),
+            Field("victim_session_id", Quote(SessionId(victim))),
+            Field("damage", Number(args[i].HitDamage)),
+            Field("x", Number(args[i].HitPosition.X)),
+            Field("y", Number(args[i].HitPosition.Y))));
+        if (victim != null) TriggerHighres(SessionId(victim), "melee_hit");
+    }
+    hits.Append(']');
+    QueueEvent("melee_action", attackerSession, ObjectJson(
+        Field("attacker_session_id", Quote(attackerSession)),
+        Field("action", Quote(attacker.IsKicking ? "kick" : "melee")),
+        Field("hit_count", args.Length.ToString()),
+        Field("hits", hits.ToString()),
+        Field("attacker", PlayerContextJson(attacker))));
+    if (args.Length > 0) TriggerHighres(attackerSession, "melee_hit");
+    if (args.Length > 0) QueueSceneWindow(attacker.IsKicking ? "kick" : "melee_hit");
+}
+
+private void OnWeaponAdded(IPlayer player, PlayerWeaponAddedArg args)
+{
+    QueueEvent("weapon_added", SessionId(player), ObjectJson(
+        Field("weapon", Quote(args.WeaponItem.ToString())),
+        Field("weapon_type", Quote(args.WeaponItemType.ToString())),
+        Field("source_object_id", args.SourceObjectID.ToString()),
+        Field("state", PlayerContextJson(player))));
+}
+
+private void OnWeaponRemoved(IPlayer player, PlayerWeaponRemovedArg args)
+{
+    QueueEvent("weapon_removed", SessionId(player), ObjectJson(
+        Field("weapon", Quote(args.WeaponItem.ToString())),
+        Field("weapon_type", Quote(args.WeaponItemType.ToString())),
+        Field("target_object_id", args.TargetObjectID.ToString()),
+        Field("dropped", Bool(args.Dropped)),
+        Field("thrown", Bool(args.Thrown)),
+        Field("state", PlayerContextJson(player))));
+}
+
+private void OnPlayerKeyInput(IPlayer player, VirtualKeyInfo[] keys)
+{
+    string sessionId = SessionId(player);
+    if (keys.Length == 0) return;
+    StringBuilder transitions = new StringBuilder("[");
+    for (int i = 0; i < keys.Length; i++)
+    {
+        if (i > 0) transitions.Append(',');
+        transitions.Append(ObjectJson(
+            Field("key", Quote(keys[i].Key.ToString())),
+            Field("event", Quote(keys[i].Event.ToString())),
+            Field("value", keys[i].Value.ToString())));
+        if (keys[i].Event == VirtualKeyEvent.Pressed && keys[i].Key == VirtualKey.GRAB)
+            TriggerHighres(sessionId, "grab_input");
+        if (keys[i].Event == VirtualKeyEvent.Pressed && keys[i].Key == VirtualKey.ATTACK &&
+            (player.IsGrabbing || player.IsHoldingPlayerInGrab || player.IsThrowing))
+            TriggerHighres(sessionId, "throw_input");
+    }
+    transitions.Append(']');
+    Vector2 pos = player.GetWorldPosition();
+    QueueEvent("key_input_batch", sessionId, ObjectJson(
+        Field("transitions", transitions.ToString()),
+        Field("team", Quote(player.GetTeam().ToString())),
+        Field("x", Number(pos.X)), Field("y", Number(pos.Y))));
+}
+
+private void OnObjectCreated(IObject[] objects)
+{
+    for (int i = 0; i < objects.Length; i++)
+    {
+        QueueEvent("object_created", "", ObjectJson(Field("object", SceneObjectJson(objects[i]))));
+    }
+}
+
+private void OnObjectDamage(IObject obj, ObjectDamageArgs args)
+{
+    QueueEvent("object_damage", "", ObjectJson(
+        Field("object", SceneObjectJson(obj)),
+        Field("damage", Number(args.Damage)), Field("damage_type", Quote(args.DamageType.ToString())),
+        Field("source_id", args.SourceID.ToString()), Field("source_is_player", Bool(args.IsPlayer)),
+        Field("health_after", Number(obj.GetHealth()))));
+    QueueSceneWindow("object_damage");
+}
+
+private void OnObjectTerminated(IObject[] objects)
+{
+    for (int i = 0; i < objects.Length; i++)
+        QueueEvent("object_terminated", "", ObjectJson(Field("object", SceneObjectJson(objects[i]))));
+}
+
+private void QueueSceneManifest()
+{
+    if (!ENABLE_SCENE_TELEMETRY) return;
+    IObject[] objects = Game.GetObjects<IObject>();
+    int limit = Math.Min(objects.Length, MAX_TRACKED_OBJECTS);
+    for (int offset = 0; offset < limit; offset += 25)
+    {
+        StringBuilder batch = new StringBuilder("[");
+        int end = Math.Min(offset + 25, limit);
+        for (int i = offset; i < end; i++)
+        {
+            if (i > offset) batch.Append(',');
+            batch.Append(SceneObjectJson(objects[i]));
+        }
+        batch.Append(']');
+        QueueEvent("scene_manifest_batch", "", ObjectJson(
+            Field("batch_offset", offset.ToString()), Field("object_total", limit.ToString()),
+            Field("entities", batch.ToString())));
+    }
+}
+
+private void SampleSceneDynamics(float now)
+{
+    IObject[] objects = Game.GetObjects<IObject>();
+    StringBuilder changed = new StringBuilder("[");
+    int added = 0;
+    for (int i = 0; i < objects.Length && i < MAX_TRACKED_OBJECTS; i++)
+    {
+        IObject obj = objects[i];
+        if (obj == null || obj.IsRemoved) continue;
+        Vector2 pos = obj.GetWorldPosition();
+        Vector2 velocity = obj.GetLinearVelocity();
+        float angle = obj.GetAngle();
+        float angular = obj.GetAngularVelocity();
+        float health = obj.GetHealth();
+        SceneState old;
+        bool known = m_sceneStates.TryGetValue(obj.UniqueID, out old);
+        bool moving = velocity.Length() >= 0.5f || Math.Abs(angular) >= 0.1f || obj.IsMissile;
+        float heartbeat = moving ? SCENE_DYNAMIC_HEARTBEAT_MS : SCENE_STATIONARY_HEARTBEAT_MS;
+        bool changedState = !known || (pos - old.Position).Length() >= 0.25f ||
+            (velocity - old.Velocity).Length() >= 0.5f || Math.Abs(angle - old.Angle) >= 0.05f ||
+            Math.Abs(angular - old.AngularVelocity) >= 0.1f || Math.Abs(health - old.Health) >= 0.01f ||
+            obj.IsMissile != old.Missile || now - old.LastSavedMs >= heartbeat;
+        if (!changedState) continue;
+        if (added >= MAX_SCENE_FRAME_OBJECTS)
+        {
+            m_sceneDroppedSampleCount++;
+            continue;
+        }
+        if (added > 0) changed.Append(',');
+        changed.Append(SceneFrameJson(obj));
+        m_sceneStates[obj.UniqueID] = new SceneState { Position = pos, Velocity = velocity, Angle = angle,
+            AngularVelocity = angular, Health = health, Missile = obj.IsMissile, LastSavedMs = now };
+        added++;
+    }
+    if (added > 0)
+    {
+        changed.Append(']');
+        QueueEvent("scene_frame_batch", "", ObjectJson(Field("entities", changed.ToString())));
+    }
+}
+
+private void QueueSceneWindow(string trigger)
+{
+    if (!ENABLE_SCENE_TELEMETRY) return;
+    float now = Game.TotalElapsedGameTime;
+    if (now - m_lastSceneWindowMs < SCENE_WINDOW_COOLDOWN_MS)
+    {
+        m_sceneWindowSuppressedCount++;
+        return;
+    }
+    m_lastSceneWindowMs = now;
+    IObject[] objects = Game.GetObjects<IObject>();
+    StringBuilder entities = new StringBuilder("[");
+    int count = Math.Min(objects.Length, MAX_SCENE_WINDOW_OBJECTS);
+    for (int i = 0; i < count; i++)
+    {
+        if (i > 0) entities.Append(',');
+        entities.Append(SceneFrameJson(objects[i]));
+    }
+    entities.Append(']');
+    QueueEvent("scene_window_complete", "", ObjectJson(
+        Field("trigger", Quote(trigger)), Field("coverage", "1"), Field("entities", entities.ToString())));
+}
+
+private string SceneObjectJson(IObject obj)
+{
+    if (obj == null) return "{}";
+    Vector2 pos = obj.GetWorldPosition();
+    Vector2 velocity = obj.GetLinearVelocity();
+    Area aabb = obj.GetAABB();
+    Point size = obj.GetSizeFactor();
+    return ObjectJson(
+        Field("kind", Quote("object")), Field("object_id", obj.UniqueID.ToString()), Field("name", Quote(obj.Name)),
+        Field("body_type", Quote(obj.GetBodyType().ToString())), Field("x", Number(pos.X)), Field("y", Number(pos.Y)),
+        Field("vx", Number(velocity.X)), Field("vy", Number(velocity.Y)), Field("angle", Number(obj.GetAngle())),
+        Field("angular_velocity", Number(obj.GetAngularVelocity())), Field("aabb", ObjectJson(Field("left", Number(aabb.Left)), Field("right", Number(aabb.Right)), Field("top", Number(aabb.Top)), Field("bottom", Number(aabb.Bottom)))),
+        Field("mass", Number(obj.GetMass())), Field("health", Number(obj.GetHealth())), Field("max_health", Number(obj.GetMaxHealth())),
+        Field("size_x", size.X.ToString()), Field("size_y", size.Y.ToString()), Field("is_missile", Bool(obj.IsMissile)),
+        Field("collision_filter", Quote(obj.GetCollisionFilter().ToString())), Field("physics_layer", Quote(obj.GetPhysicsLayer().ToString())),
+        Field("destruction_initiated", Bool(obj.DestructionInitiated)));
+}
+
+private string SceneFrameJson(IObject obj)
+{
+    if (obj == null) return "{}";
+    Vector2 pos = obj.GetWorldPosition();
+    Vector2 velocity = obj.GetLinearVelocity();
+    return ObjectJson(
+        Field("kind", Quote("object")), Field("object_id", obj.UniqueID.ToString()),
+        Field("x", Number(pos.X)), Field("y", Number(pos.Y)), Field("vx", Number(velocity.X)), Field("vy", Number(velocity.Y)),
+        Field("angle", Number(obj.GetAngle())), Field("angular_velocity", Number(obj.GetAngularVelocity())),
+        Field("health", Number(obj.GetHealth())), Field("max_health", Number(obj.GetMaxHealth())), Field("is_missile", Bool(obj.IsMissile)));
+}
+
+private void OnProjectileCreated(IProjectile[] projectiles)
+{
+    for (int i = 0; i < projectiles.Length; i++)
+    {
+        IProjectile p = projectiles[i];
+        IPlayer owner = Game.GetPlayer(p.OwnerPlayerID);
+        QueueEvent("projectile_created", SessionId(owner), ProjectileJson(p));
+        QueueEvent("scene_frame_batch", "", ObjectJson(Field("entities", "[" + ProjectileJson(p) + "]")));
+    }
+}
+
+private void OnProjectileHit(IProjectile projectile, ProjectileHitArgs args)
+{
+    IPlayer owner = Game.GetPlayer(projectile.OwnerPlayerID);
+    IPlayer victim = args.IsPlayer ? Game.GetPlayer(args.HitObjectID) : null;
+    string victimSession = SessionId(victim);
+    QueueEvent("projectile_hit", SessionId(owner), ObjectJson(
+        Field("attacker_session_id", Quote(SessionId(owner))),
+        Field("victim_session_id", Quote(victimSession)),
+        Field("damage", Number(args.Damage)),
+        Field("is_player", Bool(args.IsPlayer)),
+        Field("is_crit", Bool(args.IsCrit)),
+        Field("is_deflection", Bool(args.IsDeflection)),
+        Field("remove", Bool(args.RemoveFlag)),
+        Field("hit_object_id", args.HitObjectID.ToString()),
+        Field("hit_x", Number(args.HitPosition.X)),
+        Field("hit_y", Number(args.HitPosition.Y)),
+        Field("projectile", ProjectileJson(projectile))));
+    TriggerHighres(SessionId(owner), "projectile_hit");
+    if (victim != null) TriggerHighres(victimSession, "projectile_hit");
+    QueueSceneWindow("projectile_hit");
+}
+
+private void OnExplosionHit(ExplosionData explosion, ExplosionHitArg[] args)
+{
+    StringBuilder hits = new StringBuilder("[");
+    for (int i = 0; i < args.Length; i++)
+    {
+        if (i > 0) hits.Append(',');
+        IPlayer victim = args[i].HitObject as IPlayer;
+        string victimSession = SessionId(victim);
+        hits.Append(ObjectJson(
+            Field("object_id", args[i].ObjectID.ToString()),
+            Field("victim_session_id", Quote(victimSession)),
+            Field("is_player", Bool(args[i].IsPlayer)),
+            Field("hit_type", Quote(args[i].HitType.ToString())),
+            Field("damage", Number(args[i].Damage)),
+            Field("impact", Number(args[i].ImpactPercentage)),
+            Field("x", Number(args[i].HitPosition.X)),
+            Field("y", Number(args[i].HitPosition.Y))));
+        if (victim != null) TriggerHighres(victimSession, "explosion_hit");
+    }
+    hits.Append(']');
+    QueueEvent("explosion_hit", "", ObjectJson(
+        Field("explosion_id", explosion.InstanceID.ToString()),
+        Field("x", Number(explosion.Position.X)),
+        Field("y", Number(explosion.Position.Y)),
+        Field("radius", Number(explosion.Radius)),
+        Field("max_damage", Number(explosion.MaxDamage)),
+        Field("hits", hits.ToString())));
+    QueueSceneWindow("explosion_hit");
+}
+
+private void SamplePing()
+{
+    IUser[] users = Game.GetActiveUsers();
+    for (int i = 0; i < users.Length; i++)
+    {
+        PlayerSession session = GetOrCreateSession(users[i]);
+        QueueEvent("network_sample", session.Id, ObjectJson(
+            Field("ping_ms", users[i].Ping.ToString()),
+            Field("spectating", Bool(users[i].Spectating))));
+    }
+}
+
+private void SampleStates(float now)
+{
+    IPlayer[] players = Game.GetPlayers();
+    for (int i = 0; i < players.Length; i++)
+    {
+        IPlayer player = players[i];
+        string sessionId = SessionId(player);
+        if (string.IsNullOrEmpty(sessionId)) continue;
+        string json = PlayerHighresJson(player);
+        List<StatePoint> points;
+        if (!m_ring.TryGetValue(sessionId, out points))
+        {
+            points = new List<StatePoint>();
+            m_ring.Add(sessionId, points);
+        }
+        points.Add(new StatePoint { GameMs = now, Json = json });
+        while (points.Count > 0 && now - points[0].GameMs > HIGHRES_WINDOW_MS) points.RemoveAt(0);
+        float captureEnd;
+        if (m_captureUntil.TryGetValue(sessionId, out captureEnd))
+        {
+            if (now <= captureEnd) QueueEvent("highres_state_sample", sessionId, json);
+            else m_captureUntil.Remove(sessionId);
+        }
+    }
+}
+
+private void PersistBaselineStates()
+{
+    IPlayer[] players = Game.GetPlayers();
+    for (int i = 0; i < players.Length; i++)
+    {
+        string sessionId = SessionId(players[i]);
+        if (string.IsNullOrEmpty(sessionId)) continue;
+        QueueEvent("state_sample", sessionId, PlayerStateJson(players[i], 1));
+    }
+}
+
+private void TriggerHighres(string sessionId, string trigger)
+{
+    if (string.IsNullOrEmpty(sessionId)) return;
+    float now = Game.TotalElapsedGameTime;
+    float last;
+    if (m_lastHighresDump.TryGetValue(sessionId, out last) && now - last < 1000f)
+    {
+        m_captureUntil[sessionId] = Math.Max(m_captureUntil.ContainsKey(sessionId) ? m_captureUntil[sessionId] : 0, now + HIGHRES_POST_EVENT_MS);
+        return;
+    }
+    m_lastHighresDump[sessionId] = now;
+    m_captureUntil[sessionId] = now + HIGHRES_POST_EVENT_MS;
+    List<StatePoint> points;
+    if (!m_ring.TryGetValue(sessionId, out points)) return;
+    StringBuilder samples = new StringBuilder("[");
+    int first = Math.Max(0, points.Count - MAX_HIGHRES_WINDOW_SAMPLES);
+    for (int i = first; i < points.Count; i++)
+    {
+        if (i > first) samples.Append(',');
+        samples.Append(points[i].Json);
+    }
+    samples.Append(']');
+    QueueEvent("highres_state_window", sessionId, ObjectJson(
+        Field("trigger", Quote(trigger)),
+        Field("window_before_ms", HIGHRES_WINDOW_MS.ToString()),
+        Field("sample_limit", MAX_HIGHRES_WINDOW_SAMPLES.ToString()),
+        Field("samples", samples.ToString())));
+}
+
+private void SnapshotAllStatistics(string checkpoint)
+{
+    IPlayer[] players = Game.GetPlayers();
+    for (int i = 0; i < players.Length; i++) SnapshotStatistics(players[i], checkpoint);
+}
+
+private void SnapshotStatistics(IPlayer player, string checkpoint)
+{
+    if (player == null || player.Statistics == null) return;
+    IPlayerStatistics s = player.Statistics;
+    QueueEvent("stats_snapshot", SessionId(player), ObjectJson(
+        Field("checkpoint", Quote(checkpoint)),
+        Field("stats", ObjectJson(
+            Field("TotalBlockedAttacks", s.TotalBlockedAttacks.ToString()),
+            Field("TotalDamageTaken", Number(s.TotalDamageTaken)),
+            Field("TotalDives", s.TotalDives.ToString()),
+            Field("TotalEmptyGunsFireAttempts", s.TotalEmptyGunsFireAttempts.ToString()),
+            Field("TotalExplosionDamageTaken", Number(s.TotalExplosionDamageTaken)),
+            Field("TotalFallDamageTaken", Number(s.TotalFallDamageTaken)),
+            Field("TotalFireDamageTaken", Number(s.TotalFireDamageTaken)),
+            Field("TotalGrabbedPlayers", s.TotalGrabbedPlayers.ToString()),
+            Field("TotalGrabCharges", s.TotalGrabCharges.ToString()),
+            Field("TotalItemsThrown", s.TotalItemsThrown.ToString()),
+            Field("TotalJumps", s.TotalJumps.ToString()),
+            Field("TotalKickHits", s.TotalKickHits.ToString()),
+            Field("TotalKickSwings", s.TotalKickSwings.ToString()),
+            Field("TotalMeleeAttackHits", s.TotalMeleeAttackHits.ToString()),
+            Field("TotalMeleeAttackSwings", s.TotalMeleeAttackSwings.ToString()),
+            Field("TotalMeleeDamageTaken", Number(s.TotalMeleeDamageTaken)),
+            Field("TotalOtherDamageTaken", Number(s.TotalOtherDamageTaken)),
+            Field("TotalPlayersThrown", s.TotalPlayersThrown.ToString()),
+            Field("TotalProjectileDamageTaken", Number(s.TotalProjectileDamageTaken)),
+            Field("TotalProjectilesHitBy", s.TotalProjectilesHitBy.ToString()),
+            Field("TotalReloads", s.TotalReloads.ToString()),
+            Field("TotalRolls", s.TotalRolls.ToString()),
+            Field("TotalShotsFired", s.TotalShotsFired.ToString())))));
+}
+
+private PlayerSession EnsureSession(IUser user, string eventType)
+{
+    PlayerSession session = GetSession(user);
+    if (session == null)
+    {
+        session = CreateSession(user);
+        QueueEvent(eventType, session.Id, UserJson(user, session));
+    }
+    else
+    {
+        QueueEvent(eventType, session.Id, UserJson(user, session));
+    }
+    IPlayer player = user.GetPlayer();
+    if (player != null) s_playerSessions[player.UniqueID] = session.Id;
+    return session;
+}
+
+private PlayerSession CreateSession(IUser user)
+{
+    PlayerSession session = new PlayerSession
+    {
+        Id = Guid.NewGuid().ToString("D"),
+        UserIdentifier = user.UserIdentifier,
+        JoinedUtc = DateTime.UtcNow,
+        AccountName = user.AccountName,
+        CharacterName = user.Name
+    };
+    s_sessions[user.UserIdentifier] = session;
+    return session;
+}
+
+private PlayerSession GetOrCreateSession(IUser user)
+{
+    PlayerSession session = GetSession(user);
+    return session ?? CreateSession(user);
+}
+
+private PlayerSession GetSession(IUser user)
+{
+    if (user == null) return null;
+    PlayerSession result;
+    s_sessions.TryGetValue(user.UserIdentifier, out result);
+    return result;
+}
+
+private string SessionId(IPlayer player)
+{
+    if (player == null) return "";
+    string result;
+    if (s_playerSessions.TryGetValue(player.UniqueID, out result)) return result;
+    IUser user = player.GetUser();
+    if (user == null) return "";
+    PlayerSession session = GetOrCreateSession(user);
+    s_playerSessions[player.UniqueID] = session.Id;
+    return session.Id;
+}
+
+private string IdentityId(IUser user)
+{
+    string accountId = user.AccountID;
+    if (string.IsNullOrEmpty(accountId) || !accountId.StartsWith("S0")) return "";
+    return "host-account:" + accountId + ":" + user.LocalUserIndex.ToString();
+}
+
+private string UserJson(IUser user, PlayerSession session)
+{
+    IPlayer player = user.GetPlayer();
+    string identity = IdentityId(user);
+    return ObjectJson(
+        Field("joined_at", Quote(session.JoinedUtc.ToString("o"))),
+        Field("player_identity_id", Quote(identity)),
+        Field("identity_confidence", Quote(string.IsNullOrEmpty(identity) ? "session_only" : "host_scoped_account_hash")),
+        Field("user_identifier", user.UserIdentifier.ToString()),
+        Field("legacy_user_id", user.UserID.ToString()),
+        Field("local_user_index", user.LocalUserIndex.ToString()),
+        Field("game_slot_index", user.GameSlotIndex.ToString()),
+        Field("account_name", Quote(user.AccountName)),
+        Field("character_name", Quote(user.Name)),
+        Field("is_user", Bool(user.IsUser)),
+        Field("is_bot", Bool(user.IsBot)),
+        Field("is_host", Bool(user.IsHost)),
+        Field("is_moderator", Bool(user.IsModerator)),
+        Field("spectating", Bool(user.Spectating)),
+        Field("joined_as_spectator", Bool(user.JoinedAsSpectator)),
+        Field("team", Quote(user.GetTeam().ToString())),
+        Field("ping", user.Ping.ToString()),
+        Field("total_games", user.TotalGames.ToString()),
+        Field("total_wins", user.TotalWins.ToString()),
+        Field("total_losses", user.TotalLosses.ToString()),
+        Field("avatar_gender", Quote(user.Gender.ToString())),
+        Field("profile", ProfileJson(user.GetProfile())),
+        Field("state", player == null ? "null" : PlayerStateJson(player, 0)));
+}
+
+private string ProfileJson(IProfile profile)
+{
+    if (profile == null) return "null";
+    return ObjectJson(
+        Field("name", Quote(profile.Name)),
+        Field("avatar_gender", Quote(profile.Gender.ToString())),
+        Field("skin", ClothingJson(profile.Skin)),
+        Field("chest_over", ClothingJson(profile.ChestOver)),
+        Field("chest_under", ClothingJson(profile.ChestUnder)),
+        Field("hands", ClothingJson(profile.Hands)),
+        Field("waist", ClothingJson(profile.Waist)),
+        Field("legs", ClothingJson(profile.Legs)),
+        Field("feet", ClothingJson(profile.Feet)),
+        Field("accessory", ClothingJson(profile.Accessory)),
+        Field("head", ClothingJson(profile.Head)));
+}
+
+private string ClothingJson(IProfileClothingItem item)
+{
+    if (item == null) return "null";
+    return ObjectJson(
+        Field("name", Quote(item.Name)),
+        Field("palette", Quote(item.ColorPalette)),
+        Field("color1", Quote(item.Color1)),
+        Field("color2", Quote(item.Color2)),
+        Field("color3", Quote(item.Color3)));
+}
+
+private string PlayerHighresJson(IPlayer p)
+{
+    Vector2 pos = p.GetWorldPosition();
+    Vector2 velocity = p.GetLinearVelocity();
+    return ObjectJson(
+        Field("resolution_hz", "20"), Field("game_ms", Number(Game.TotalElapsedGameTime)),
+        Field("x", Number(pos.X)), Field("y", Number(pos.Y)), Field("vx", Number(velocity.X)), Field("vy", Number(velocity.Y)),
+        Field("hp", Number(p.GetHealth())), Field("energy", Number(p.GetEnergy())), Field("team", Quote(p.GetTeam().ToString())),
+        Field("dead", Bool(p.IsDead)), Field("facing", p.FacingDirection.ToString()), Field("weapon", Quote(p.CurrentWeaponDrawn.ToString())),
+        Field("blocking", Bool(p.IsBlocking)), Field("rolling", Bool(p.IsRolling)), Field("grabbing", Bool(p.IsGrabbing)), Field("throwing", Bool(p.IsThrowing)));
+}
+
+private string PlayerStateJson(IPlayer p, int resolutionHz)
+{
+    Vector2 pos = p.GetWorldPosition();
+    Vector2 velocity = p.GetLinearVelocity();
+    return ObjectJson(
+        Field("resolution_hz", resolutionHz.ToString()),
+        Field("x", Number(pos.X)), Field("y", Number(pos.Y)),
+        Field("vx", Number(velocity.X)), Field("vy", Number(velocity.Y)),
+        Field("facing", p.FacingDirection.ToString()),
+        Field("aim_x", Number(p.AimVector.X)), Field("aim_y", Number(p.AimVector.Y)),
+        Field("hp", Number(p.GetHealth())), Field("max_hp", Number(p.GetMaxHealth())),
+        Field("energy", Number(p.GetEnergy())), Field("max_energy", Number(p.GetMaxEnergy())),
+        Field("team", Quote(p.GetTeam().ToString())),
+        Field("dead", Bool(p.IsDead)), Field("removed", Bool(p.IsRemoved)),
+        Field("weapon_drawn", Quote(p.CurrentWeaponDrawn.ToString())),
+        Field("primary", RangedJson(p.CurrentPrimaryRangedWeapon)),
+        Field("secondary", RangedJson(p.CurrentSecondaryRangedWeapon)),
+        Field("melee", MeleeJson(p.CurrentMeleeWeapon)),
+        Field("throwable", ThrownJson(p.CurrentThrownItem)),
+        Field("blocking", Bool(p.IsBlocking)), Field("walking", Bool(p.IsWalking)),
+        Field("running", Bool(p.IsRunning)), Field("sprinting", Bool(p.IsSprinting)),
+        Field("crouching", Bool(p.IsCrouching)), Field("falling", Bool(p.IsFalling)),
+        Field("diving", Bool(p.IsDiving)), Field("rolling", Bool(p.IsRolling)),
+        Field("grabbing", Bool(p.IsGrabbing)), Field("throwing", Bool(p.IsThrowing)),
+        Field("stunned", Bool(p.IsStunned)), Field("staggering", Bool(p.IsStaggering)),
+        Field("taking_cover", Bool(p.IsTakingCover)), Field("drawing_weapon", Bool(p.IsDrawingWeapon)),
+        Field("hip_firing", Bool(p.IsHipFiring)), Field("manual_aiming", Bool(p.IsManualAiming)),
+        Field("reloading", Bool(p.IsReloading)), Field("in_mid_air", Bool(p.IsInMidAir)),
+        Field("burning", Bool(p.IsBurning)), Field("boost_health", Bool(p.IsBoostHealthActive)),
+        Field("boost_speed", Bool(p.IsSpeedBoostActive)), Field("boost_strength", Bool(p.IsStrengthBoostActive)));
+}
+
+private string PlayerContextJson(IPlayer p)
+{
+    if (p == null) return "null";
+    Vector2 pos = p.GetWorldPosition();
+    IUser user = p.GetUser();
+    return ObjectJson(
+        Field("player_session_id", Quote(SessionId(p))),
+        Field("object_id", p.UniqueID.ToString()),
+        Field("x", Number(pos.X)), Field("y", Number(pos.Y)),
+        Field("hp", Number(p.GetHealth())), Field("energy", Number(p.GetEnergy())),
+        Field("team", Quote(p.GetTeam().ToString())),
+        Field("facing", p.FacingDirection.ToString()),
+        Field("weapon", Quote(p.CurrentWeaponDrawn.ToString())),
+        Field("dead", Bool(p.IsDead)), Field("blocking", Bool(p.IsBlocking)),
+        Field("ping", user == null ? "null" : user.Ping.ToString()));
+}
+
+private string RangedJson(RangedWeaponItem item)
+{
+    return ObjectJson(
+        Field("weapon", Quote(item.WeaponItem.ToString())),
+        Field("ammo", item.CurrentAmmo.ToString()),
+        Field("total_ammo", item.TotalAmmo.ToString()),
+        Field("spare_mags", item.SpareMags.ToString()),
+        Field("projectile", Quote(item.ProjectileItem.ToString())));
+}
+
+private string MeleeJson(MeleeWeaponItem item)
+{
+    return ObjectJson(Field("weapon", Quote(item.WeaponItem.ToString())), Field("durability", Number(item.CurrentValue)));
+}
+
+private string ThrownJson(ThrownWeaponItem item)
+{
+    return ObjectJson(Field("weapon", Quote(item.WeaponItem.ToString())), Field("ammo", item.CurrentAmmo.ToString()));
+}
+
+private string ProjectileJson(IProjectile p)
+{
+    return ObjectJson(
+        Field("kind", Quote("projectile")),
+        Field("instance_id", p.InstanceID.ToString()),
+        Field("projectile", Quote(p.ProjectileItem.ToString())),
+        Field("owner_player_id", p.OwnerPlayerID.ToString()),
+        Field("initial_owner_player_id", p.InitialOwnerPlayerID.ToString()),
+        Field("x", Number(p.Position.X)), Field("y", Number(p.Position.Y)),
+        Field("vx", Number(p.Velocity.X)), Field("vy", Number(p.Velocity.Y)),
+        Field("distance_traveled", Number(p.TotalDistanceTraveled)),
+        Field("bounce_count", p.BounceCount.ToString()),
+        Field("fire_powerup", Bool(p.PowerupFireActive)),
+        Field("bounce_powerup", Bool(p.PowerupBounceActive)));
+}
+
+private IPlayer ResolveDamageAttacker(PlayerDamageArgs args)
+{
+    if (args.DamageType == PlayerDamageEventType.Melee) return Game.GetPlayer(args.SourceID);
+    if (args.DamageType == PlayerDamageEventType.Projectile)
+    {
+        IProjectile projectile = Game.GetProjectile(args.SourceID);
+        if (projectile != null) return Game.GetPlayer(projectile.OwnerPlayerID);
+    }
+    return null;
+}
+
+private float Distance(IPlayer a, IPlayer b)
+{
+    if (a == null || b == null) return -1;
+    return (a.GetWorldPosition() - b.GetWorldPosition()).Length();
+}
+
+private void QueueRoundStart()
+{
+    IUser[] users = Game.GetActiveUsers();
+    int humans = 0, bots = 0;
+    StringBuilder composition = new StringBuilder("[");
+    for (int i = 0; i < users.Length; i++)
+    {
+        if (users[i].IsBot) bots++; else if (users[i].IsUser) humans++;
+        if (i > 0) composition.Append(',');
+        composition.Append(ObjectJson(
+            Field("player_session_id", Quote(GetOrCreateSession(users[i]).Id)),
+            Field("team", Quote(users[i].GetTeam().ToString())),
+            Field("is_bot", Bool(users[i].IsBot)),
+            Field("spectating", Bool(users[i].Spectating))));
+    }
+    composition.Append(']');
+    QueueEvent("round_start", "", ObjectJson(
+        Field("map_name", Quote(Game.MapName)),
+        Field("map_guid", Quote(Game.MapGUID.ToString())),
+        Field("map_original_guid", Quote(Game.MapOriginalGUID.ToString())),
+        Field("map_author", Quote(Game.MapAuthor)),
+        Field("map_round", Game.MapRound.ToString()),
+        Field("map_type", Quote(Game.GetMapType().ToString())),
+        Field("game_type", Quote(Game.GetGameType().ToString())),
+        Field("time_limit_seconds", Game.TimeLimit.ToString()),
+        Field("time_limit_active", Bool(Game.TimeLimitActive)),
+        Field("sudden_death_enabled", Bool(Game.SuddenDeathEnabled)),
+        Field("player_count", users.Length.ToString()),
+        Field("human_count", humans.ToString()),
+        Field("bot_count", bots.ToString()),
+        Field("composition", composition.ToString())));
+}
+
+private void EndRound(string reason)
+{
+    if (m_roundEnded) return;
+    m_roundEnded = true;
+    IPlayer[] players = Game.GetPlayers();
+    List<IPlayer> alive = new List<IPlayer>();
+    for (int i = 0; i < players.Length; i++)
+        if (!players[i].IsDead && !players[i].IsRemoved) alive.Add(players[i]);
+    string resultSource = "unknown";
+    bool draw = false;
+    StringBuilder winners = new StringBuilder("[");
+    if (Game.IsGameOver && alive.Count == 0)
+    {
+        draw = true;
+        resultSource = "inferred_no_alive_players";
+    }
+    else if (Game.IsGameOver && alive.Count == 1 && alive[0].GetTeam() == PlayerTeam.Independent)
+    {
+        winners.Append(Quote(SessionId(alive[0])));
+        resultSource = "inferred_alive_state";
+    }
+    else if (Game.IsGameOver && alive.Count > 0)
+    {
+        PlayerTeam team = alive[0].GetTeam();
+        bool oneTeam = team != PlayerTeam.Independent;
+        for (int i = 1; i < alive.Count; i++) if (alive[i].GetTeam() != team) oneTeam = false;
+        if (oneTeam)
+        {
+            resultSource = "inferred_alive_state";
+            for (int i = 0; i < alive.Count; i++)
+            {
+                if (i > 0) winners.Append(',');
+                winners.Append(Quote(SessionId(alive[i])));
+            }
+        }
+    }
+    winners.Append(']');
+    QueueEvent("round_end", "", ObjectJson(
+        Field("reason", Quote(reason)),
+        Field("duration_ms", Number(Game.TotalElapsedGameTime - m_roundStartMs)),
+        Field("is_game_over", Bool(Game.IsGameOver)),
+        Field("sudden_death_active", Bool(Game.SuddenDeathActive)),
+        Field("draw", Bool(draw)),
+        Field("winners", winners.ToString()),
+        Field("result_source", Quote(resultSource))));
+}
+
+private void QueueHealth()
+{
+    QueueEvent("telemetry_health", "", ObjectJson(
+        Field("dropped_event_count", m_droppedEventCount.ToString()),
+        Field("dropped_low_priority_event_count", m_droppedLowPriorityEventCount.ToString()),
+        Field("pending_event_count", m_pending.Count.ToString()),
+        Field("pending_capacity", MAX_PENDING_EVENTS.ToString()),
+        Field("flush_interval_ms", STORAGE_FLUSH_INTERVAL_MS.ToString()),
+        Field("scene_dropped_sample_count", m_sceneDroppedSampleCount.ToString()),
+        Field("scene_window_suppressed_count", m_sceneWindowSuppressedCount.ToString()),
+        Field("storage_slot", m_storageSlot.ToString())));
+    m_lastReportedDroppedCount = m_droppedEventCount;
+}
+
+private void QueueEvent(string type, string playerSessionId, string dataJson)
+{
+    long sequence = ++s_sequence;
+    string envelope = ObjectJson(
+        Field("v", "1"),
+        Field("seq", sequence.ToString()),
+        Field("ts", Quote(DateTime.UtcNow.ToString("o"))),
+        Field("type", Quote(type)),
+        Field("server_session", Quote(s_serverSessionId)),
+        Field("round", Quote(m_roundId)),
+        Field("player", string.IsNullOrEmpty(playerSessionId) ? "null" : Quote(playerSessionId)),
+        Field("game_ms", Number(Game.TotalElapsedGameTime)),
+        Field("round_ms", Number(Game.TotalElapsedGameTime - m_roundStartMs)),
+        Field("data", dataJson));
+    string raw = PREFIX + envelope;
+    if (m_pending.Count >= MAX_PENDING_EVENTS)
+    {
+        int lowPriorityIndex = FindOldestLowPriorityEvent();
+        if (IsCriticalEvent(type) && lowPriorityIndex >= 0)
+        {
+            m_pending.RemoveAt(lowPriorityIndex);
+            m_pendingTypes.RemoveAt(lowPriorityIndex);
+            m_droppedLowPriorityEventCount++;
+        }
+        else
+        {
+            if (type == "scene_frame_batch" || type == "scene_window_complete") m_sceneDroppedSampleCount++;
+            m_droppedEventCount++;
+            return;
+        }
+    }
+    m_pending.Add(Convert.ToBase64String(Encoding.UTF8.GetBytes(raw)));
+    m_pendingTypes.Add(type);
+    if (VERBOSE_DEBUG && type != "state_sample" && type != "highres_state_sample")
+        Game.WriteToConsole("SFDTelemetry " + type + " #" + sequence.ToString());
+}
+
+private void FlushPending()
+{
+    if (m_pending.Count == 0 || m_transport == null) return;
+    int count = Math.Min(MAX_EVENTS_PER_SLOT, m_pending.Count);
+    string[] values = m_pending.GetRange(0, count).ToArray();
+    m_pending.RemoveRange(0, count);
+    m_pendingTypes.RemoveRange(0, count);
+    m_transport.SetItem("slot_" + m_storageSlot.ToString(), values);
+    m_storageSlot = (m_storageSlot + 1) % STORAGE_SLOT_COUNT;
+    if (m_droppedEventCount != m_lastReportedDroppedCount) QueueHealth();
+}
+
+private bool IsCriticalEvent(string type)
+{
+    return type == "player_damage" || type == "player_death" || type == "round_start" ||
+        type == "round_end" || type == "user_join" || type == "user_leave" ||
+        type == "chat_message";
+}
+
+private int FindOldestLowPriorityEvent()
+{
+    for (int i = 0; i < m_pendingTypes.Count; i++)
+    {
+        string type = m_pendingTypes[i];
+        if (type == "key_input_batch" || type == "key_input" || type == "state_sample" || type == "scene_frame_batch" || type == "scene_window_complete" ||
+            type == "highres_state_sample" || type == "highres_state_window") return i;
+    }
+    return -1;
+}
+
+private void ForceFlush()
+{
+    int safety = 0;
+    while (m_pending.Count > 0 && safety < (MAX_PENDING_EVENTS / MAX_EVENTS_PER_SLOT + 2))
+    {
+        FlushPending();
+        safety++;
+    }
+}
+
+private string Field(string name, string rawValue)
+{
+    return Quote(name) + ":" + (rawValue ?? "null");
+}
+
+private string ObjectJson(params string[] fields)
+{
+    StringBuilder result = new StringBuilder("{");
+    for (int i = 0; i < fields.Length; i++)
+    {
+        if (i > 0) result.Append(',');
+        result.Append(fields[i]);
+    }
+    result.Append('}');
+    return result.ToString();
+}
+
+private string Quote(string value)
+{
+    if (value == null) return "null";
+    StringBuilder result = new StringBuilder(value.Length + 2);
+    result.Append('"');
+    for (int i = 0; i < value.Length; i++)
+    {
+        char c = value[i];
+        if (c == '"') result.Append("\\\"");
+        else if (c == '\\') result.Append("\\\\");
+        else if (c == '\b') result.Append("\\b");
+        else if (c == '\f') result.Append("\\f");
+        else if (c == '\n') result.Append("\\n");
+        else if (c == '\r') result.Append("\\r");
+        else if (c == '\t') result.Append("\\t");
+        else if (c < 32) result.Append("\\u" + ((int)c).ToString("x4"));
+        else result.Append(c);
+    }
+    result.Append('"');
+    return result.ToString();
+}
+
+private string Bool(bool value) { return value ? "true" : "false"; }
+private string Number(float value) { return value.ToString("R", System.Globalization.CultureInfo.InvariantCulture); }
+private string Number(double value) { return value.ToString("R", System.Globalization.CultureInfo.InvariantCulture); }

@@ -1,0 +1,17 @@
+{
+  "shared_storage_path": "%USERPROFILE%\\Documents\\Superfighters Deluxe\\Cache\\ScriptData\\Shared\\CCC.txt",
+  "database_path": "data/sfd_telemetry.sqlite3",
+  "poll_interval_seconds": 0.5,
+  "batch_size": 250,
+  "busy_timeout_ms": 5000,
+  "raw_archive_enabled": true,
+  "raw_archive_dir": "data/raw",
+  "malformed_log_path": "data/malformed_events.jsonl",
+  "gzip_raw_after_days": 2,
+  "gameplay_retention_days": 0,
+  "chat_retention_days": 30,
+  "scene_raw_retention_days": 90,
+  "scene_episode_retention_days": 0,
+  "scene_aggregate_retention_days": 0,
+  "backup_dir": "data/backups"
+}

@@ -1,0 +1,2 @@
+openai==3.3.1
+scikit-learn==1.9.0

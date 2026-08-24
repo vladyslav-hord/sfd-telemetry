@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+
+# Secrets and local overrides
+OPENAI_API
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local configuration and tooling state
+collector/config.json
+analyzer/config.json
+.serena/
+
+# Runtime telemetry, reports and generated dashboard
+data/
+data/raw/
+data/backups/
+data/malformed_events.jsonl
+*.sqlite3
+data/*.sqlite3-wal
+data/*.sqlite3-shm
