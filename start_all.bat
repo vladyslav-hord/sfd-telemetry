@@ -13,6 +13,8 @@ if not exist "%SFD_GAME%" (
 )
 schtasks /Run /TN "SFD Telemetry Collector" >nul 2>&1
 if errorlevel 1 start "SFD Telemetry Collector" /min cmd.exe /c call "%~dp0start_collector.bat"
+schtasks /Run /TN "SFD Telemetry Analyzer Live" >nul 2>&1
+if errorlevel 1 start "SFD Telemetry Analyzer Live" /min cmd.exe /c call "%~dp0start_analyzer.bat"
 tasklist /FI "IMAGENAME eq Superfighters Deluxe Server.exe" 2>nul | find /I "Superfighters Deluxe Server.exe" >nul
 if errorlevel 1 start "SFD Server" /min "%SFD_GAME%" -server -start -totray
 endlocal

@@ -25,6 +25,8 @@ class TelemetryDB:
         columns = {row[1] for row in self.connection.execute("PRAGMA table_info(player_stat_snapshots)")}
         if "delta_json" not in columns:
             self.connection.execute("ALTER TABLE player_stat_snapshots ADD COLUMN delta_json TEXT")
+        self.connection.execute("UPDATE storage_health SET gap_count=(SELECT COUNT(*) FROM telemetry_gaps) WHERE component='raw'")
+        self.connection.commit()
 
     def close(self) -> None:
         self.connection.close()
@@ -409,6 +411,10 @@ class TelemetryDB:
             self.connection.execute(
                 "INSERT OR IGNORE INTO telemetry_gaps(server_session_id, expected_sequence, observed_sequence, detected_at) VALUES(?,?,?,?)",
                 (server_session, expected, observed, detected_at),
+            )
+            self.connection.execute(
+                "UPDATE storage_health SET gap_count=(SELECT COUNT(*) FROM telemetry_gaps),updated_at=? WHERE component='raw'",
+                (detected_at,),
             )
 
     def last_sequences(self) -> dict[str, int]:

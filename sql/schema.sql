@@ -295,13 +295,19 @@ CREATE TABLE IF NOT EXISTS telemetry_gaps (
 CREATE INDEX IF NOT EXISTS idx_events_player_time ON events(player_session_id, utc_timestamp);
 CREATE INDEX IF NOT EXISTS idx_events_round ON events(round_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(event_type, utc_timestamp);
+CREATE INDEX IF NOT EXISTS idx_events_utc_time ON events(utc_timestamp, event_id);
 CREATE INDEX IF NOT EXISTS idx_player_sessions_identity ON player_sessions(player_identity_id, joined_at);
+CREATE INDEX IF NOT EXISTS idx_player_sessions_join_leave ON player_sessions(joined_at, left_at);
 CREATE INDEX IF NOT EXISTS idx_rounds_map_time ON rounds(map_name, started_at);
+CREATE INDEX IF NOT EXISTS idx_rounds_started ON rounds(started_at, round_id);
 CREATE INDEX IF NOT EXISTS idx_chat_sender_time ON chat_messages(player_session_id, utc_timestamp);
 CREATE INDEX IF NOT EXISTS idx_network_player_time ON network_samples(player_session_id, utc_timestamp);
+CREATE INDEX IF NOT EXISTS idx_network_utc_time ON network_samples(utc_timestamp, player_session_id, sample_id);
 CREATE INDEX IF NOT EXISTS idx_state_player_time ON state_samples(player_session_id, game_ms);
 CREATE INDEX IF NOT EXISTS idx_state_round_time ON state_samples(round_id, game_ms);
+CREATE INDEX IF NOT EXISTS idx_state_utc_time ON state_samples(utc_timestamp, player_session_id, game_ms);
 CREATE INDEX IF NOT EXISTS idx_state_windows_player_time ON state_windows(player_session_id, utc_timestamp);
+CREATE INDEX IF NOT EXISTS idx_state_windows_utc_time ON state_windows(utc_timestamp);
 CREATE INDEX IF NOT EXISTS idx_combat_hit_details_victim ON combat_hit_details(victim_session_id);
 CREATE INDEX IF NOT EXISTS idx_scene_entities_round ON scene_entities(round_id, entity_kind, engine_id);
 CREATE INDEX IF NOT EXISTS idx_scene_samples_entity_time ON scene_samples(scene_entity_id, game_ms);
@@ -309,4 +315,39 @@ CREATE INDEX IF NOT EXISTS idx_scene_samples_round_time ON scene_samples(round_i
 CREATE INDEX IF NOT EXISTS idx_scene_interactions_player_time ON scene_interactions(player_session_id, game_ms);
 CREATE INDEX IF NOT EXISTS idx_scene_interactions_target ON scene_interactions(target_entity_id, game_ms);
 CREATE INDEX IF NOT EXISTS idx_scene_interactions_type_time ON scene_interactions(interaction_type, utc_timestamp);
+CREATE INDEX IF NOT EXISTS idx_scene_interactions_utc_time ON scene_interactions(utc_timestamp, scene_interaction_id);
 CREATE INDEX IF NOT EXISTS idx_scene_windows_round_time ON scene_windows(round_id, trigger_game_ms);
+CREATE INDEX IF NOT EXISTS idx_telemetry_gaps_detected ON telemetry_gaps(detected_at);
+
+-- Live retention and storage accounting. These tables are deliberately local to
+-- telemetry so the collector can report degradation even when the analyzer is down.
+CREATE TABLE IF NOT EXISTS raw_segments (
+  raw_segment_id INTEGER PRIMARY KEY,
+  path TEXT NOT NULL UNIQUE,
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  server_session_id TEXT,
+  first_sequence INTEGER,
+  last_sequence INTEGER,
+  sha256 TEXT,
+  compression_status TEXT NOT NULL DEFAULT 'active',
+  processing_status TEXT NOT NULL DEFAULT 'available',
+  retention_priority INTEGER NOT NULL DEFAULT 5,
+  safe_delete_after TEXT,
+  created_at TEXT NOT NULL,
+  closed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS storage_health (
+  component TEXT PRIMARY KEY,
+  used_bytes INTEGER NOT NULL DEFAULT 0,
+  max_bytes INTEGER NOT NULL DEFAULT 0,
+  watermark REAL NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'ok',
+  dropped_count INTEGER NOT NULL DEFAULT 0,
+  malformed_count INTEGER NOT NULL DEFAULT 0,
+  gap_count INTEGER NOT NULL DEFAULT 0,
+  details_json TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_raw_segments_status ON raw_segments(processing_status, retention_priority, created_at);

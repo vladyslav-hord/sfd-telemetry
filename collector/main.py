@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import json
 import os
 import shutil
@@ -9,6 +10,7 @@ import signal
 import sqlite3
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,55 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "collector" / "config.example.json"
+
+
+@contextmanager
+def collector_lock(path: Path):
+    """Allow only one collector writer per telemetry database."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    locked = False
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise RuntimeError("Another collector process is already running") from exc
+        else:
+            import fcntl
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise RuntimeError("Another collector process is already running") from exc
+        locked = True
+        try:
+            handle.seek(0)
+            handle.write("0")
+            handle.flush()
+        except OSError as exc:
+            locked = False
+            raise RuntimeError("Another collector process is already running") from exc
+        yield
+    finally:
+        if locked and os.name == "nt":
+            try:
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        elif locked:
+            try:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        try:
+            handle.close()
+        except OSError:
+            pass
 
 
 def utc_now() -> str:
@@ -70,8 +121,15 @@ class Collector:
         self.archive_enabled = bool(config.get("raw_archive_enabled", True))
         self.archive_dir = resolve_path(config.get("raw_archive_dir", "data/raw"))
         self.archive_dir.mkdir(parents=True, exist_ok=True)
+        self.raw_max_bytes = max(1, int(config.get("raw_archive_max_bytes", 1073741824)))
+        self.raw_segment_max_bytes = max(1024, int(config.get("raw_segment_max_bytes", 33554432)))
+        self.raw_gzip_level = min(9, max(1, int(config.get("raw_gzip_level", 1))))
+        self.raw_high_watermark = float(config.get("raw_high_watermark", .85))
+        self.raw_critical_watermark = float(config.get("raw_critical_watermark", .95))
 
     def close(self) -> None:
+        if self.archive_enabled:
+            self._close_active_segments()
         self.db.close()
 
     def request_stop(self, *_: object) -> None:
@@ -152,15 +210,141 @@ class Collector:
         return 0
 
     def _write_malformed(self, message: str) -> None:
+        if self._raw_usage() >= self.raw_max_bytes:
+            self._update_raw_health(malformed=1, dropped=1, state="full")
+            return
         with self.malformed_path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps({"ts": utc_now(), "error": message}, ensure_ascii=False) + "\n")
+        self._update_raw_health(malformed=1)
 
     def _archive(self, items: list[Any]) -> None:
+        if not items or not self.archive_enabled:
+            return
+        for item in items:
+            raw = (item.raw_line + "\n").encode("utf-8")
+            if len(raw) > self.raw_segment_max_bytes:
+                self._update_raw_health(dropped=1, state="degraded")
+                continue
+            event = item.envelope
+            path = self._active_path()
+            segment = self.db.connection.execute(
+                "SELECT server_session_id FROM raw_segments WHERE path=? AND compression_status='active'",
+                (str(path),),
+            ).fetchone()
+            if segment and segment["server_session_id"] != event.get("server_session"):
+                self._close_segment(path)
+                path = self._active_path()
+            size = path.stat().st_size if path.exists() else 0
+            if size and size + len(raw) > self.raw_segment_max_bytes:
+                self._close_segment(path)
+                path = self._active_path()
+                size = 0
+            if self._raw_usage() + len(raw) > self.raw_max_bytes:
+                self._evict_processed_segments()
+            if self._raw_usage() + len(raw) > self.raw_max_bytes:
+                self._update_raw_health(dropped=1, state="full")
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("ab") as handle:
+                handle.write(raw)
+            self.db.connection.execute(
+                """INSERT INTO raw_segments(path,size_bytes,server_session_id,first_sequence,last_sequence,
+                   compression_status,processing_status,retention_priority,created_at)
+                   VALUES(?,?,?,?,?,'active','available',?,?)
+                   ON CONFLICT(path) DO UPDATE SET size_bytes=excluded.size_bytes,
+                   server_session_id=CASE WHEN raw_segments.server_session_id=excluded.server_session_id THEN raw_segments.server_session_id ELSE NULL END,
+                   first_sequence=MIN(raw_segments.first_sequence,excluded.first_sequence),
+                   last_sequence=MAX(raw_segments.last_sequence,excluded.last_sequence)""",
+                (str(path), path.stat().st_size, event.get("server_session"), event.get("seq"), event.get("seq"),
+                 self._raw_priority(event.get("type")), utc_now()),
+            )
+        self.db.connection.commit()
+        self._update_raw_health()
+        if self._raw_usage() >= self.raw_high_watermark * self.raw_max_bytes:
+            self._close_active_segments()
+            self._evict_processed_segments()
+            self._update_raw_health()
+
+    def _active_path(self) -> Path:
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        path = self.archive_dir / f"telemetry-{day}.jsonl"
-        with path.open("a", encoding="utf-8", newline="\n") as handle:
-            for item in items:
-                handle.write(item.raw_line + "\n")
+        directory = self.archive_dir / day
+        existing = sorted(directory.glob("telemetry-*.jsonl")) if directory.exists() else []
+        if existing:
+            return existing[-1]
+        known = sorted(directory.glob("telemetry-*.jsonl*")) if directory.exists() else []
+        number = 1
+        for path in known:
+            token = path.name.removeprefix("telemetry-").split(".", 1)[0]
+            if token.isdigit():
+                number = max(number, int(token) + 1)
+        return directory / f"telemetry-{number:06d}.jsonl"
+
+    def _close_active_segments(self) -> None:
+        for path in self.archive_dir.rglob("*.jsonl"):
+            self._close_segment(path)
+
+    def _close_segment(self, path: Path) -> None:
+        if not path.exists() or path.stat().st_size == 0:
+            return
+        target = Path(str(path) + ".gz")
+        if target.exists():
+            suffix = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+            target = path.with_name(f"{path.stem}-closed-{suffix}.jsonl.gz")
+        with path.open("rb") as source, gzip.open(target, "wb", compresslevel=self.raw_gzip_level) as destination:
+            shutil.copyfileobj(source, destination)
+        checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+        row = self.db.connection.execute("SELECT first_sequence,last_sequence,server_session_id,retention_priority FROM raw_segments WHERE path=?", (str(path),)).fetchone()
+        if row:
+            self.db.connection.execute(
+                """UPDATE raw_segments SET path=?,size_bytes=?,sha256=?,compression_status='gzip',
+                   closed_at=?,safe_delete_after=? WHERE path=?""",
+                (str(target), target.stat().st_size, checksum, utc_now(), utc_now(), str(path)),
+            )
+            self.db.connection.commit()
+        path.unlink()
+
+    def _raw_usage(self) -> int:
+        total = sum(path.stat().st_size for path in self.archive_dir.rglob("*") if path.is_file())
+        if self.malformed_path.exists():
+            total += self.malformed_path.stat().st_size
+        return total
+
+    def _raw_priority(self, event_type: str | None) -> int:
+        if event_type in {"script_start", "script_shutdown", "user_join", "user_leave", "round_start", "round_end", "player_death"}:
+            return 1
+        if event_type in {"scene_window_complete", "object_damage", "object_terminated", "projectile_hit", "explosion_hit"}:
+            return 2
+        if event_type in {"chat_message", "player_damage", "melee_action"}:
+            return 3
+        if event_type in {"network_sample", "state_sample", "input_action"}:
+            return 4
+        return 5
+
+    def _evict_processed_segments(self) -> None:
+        rows = self.db.connection.execute(
+            "SELECT raw_segment_id,path FROM raw_segments WHERE processing_status='processed' ORDER BY retention_priority DESC,created_at"
+        ).fetchall()
+        for row in rows:
+            if self._raw_usage() < self.raw_critical_watermark * self.raw_max_bytes:
+                break
+            Path(row[1]).unlink(missing_ok=True)
+            self.db.connection.execute("DELETE FROM raw_segments WHERE raw_segment_id=?", (row[0],))
+        self.db.connection.commit()
+
+    def _update_raw_health(self, *, dropped: int = 0, malformed: int = 0, state: str | None = None) -> None:
+        used = self._raw_usage()
+        watermark = used / self.raw_max_bytes
+        resolved = state or ("full" if watermark >= 1 else "critical" if watermark >= self.raw_critical_watermark else "high" if watermark >= self.raw_high_watermark else "ok")
+        self.db.connection.execute(
+            """INSERT INTO storage_health(component,used_bytes,max_bytes,watermark,state,dropped_count,malformed_count,gap_count,updated_at)
+               VALUES('raw',?,?,?,?,?,?,(SELECT COUNT(*) FROM telemetry_gaps),?) ON CONFLICT(component) DO UPDATE SET used_bytes=excluded.used_bytes,
+               max_bytes=excluded.max_bytes,watermark=excluded.watermark,state=excluded.state,
+               dropped_count=storage_health.dropped_count+excluded.dropped_count,
+               malformed_count=storage_health.malformed_count+excluded.malformed_count,
+               gap_count=(SELECT COUNT(*) FROM telemetry_gaps),updated_at=excluded.updated_at""",
+            (used, self.raw_max_bytes, watermark, resolved, dropped, malformed, utc_now()),
+        )
+        self.db.connection.commit()
 
 
 def maintenance(config: dict[str, Any], vacuum: bool) -> int:
@@ -241,16 +425,23 @@ def main() -> int:
         return maintenance(config, args.vacuum)
     if args.command == "backup":
         return backup(config, args.destination)
-    collector = Collector(config)
-    try:
-        if args.command == "once":
-            result = collector.process_once(force=True)
-            print(f"inserted={result[0]} duplicates={result[1]} malformed={result[2]}")
-            return 0
-        return collector.run()
-    finally:
-        collector.close()
+    database_path = resolve_path(config["database_path"])
+    lock_path = database_path.with_suffix(".collector.lock")
+    with collector_lock(lock_path):
+        collector = Collector(config)
+        try:
+            if args.command == "once":
+                result = collector.process_once(force=True)
+                print(f"inserted={result[0]} duplicates={result[1]} malformed={result[2]}")
+                return 0
+            return collector.run()
+        finally:
+            collector.close()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"collector failed: {exc}", file=sys.stderr)
+        raise SystemExit(1)

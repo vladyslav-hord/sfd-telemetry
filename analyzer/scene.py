@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from typing import Any
 
 
@@ -45,7 +45,7 @@ def _barrel_candidates(conn, start: str, end: str) -> list[dict]:
            WHERE i.interaction_type IN ('player_kick_object','player_melee_object')
              AND i.utc_timestamp>=? AND i.utc_timestamp<?""",
         (start, end),
-    ).fetchall()
+    )
     result = []
     for row in rows:
         if object_category(row["name"]) != "barrel" or not row["player_session_id"] or row["game_ms"] is None:
@@ -90,20 +90,28 @@ def _motifs(conn, start: str, end: str) -> list[dict]:
            FROM scene_interactions WHERE player_session_id IS NOT NULL AND utc_timestamp>=? AND utc_timestamp<?
            ORDER BY player_session_id,round_id,game_ms""",
         (start, end),
-    ).fetchall()
+    )
     sequences: Counter[tuple[str, ...]] = Counter()
-    grouped: dict[tuple[str, str], list] = defaultdict(list)
+    current_key = None
+    actions = deque(maxlen=8)
+
+    def flush_action(row):
+        nonlocal current_key, actions
+        key = (row["player_session_id"], row["round_id"])
+        if key != current_key:
+            current_key, actions = key, deque(maxlen=8)
+        if row["game_ms"] is None:
+            return
+        actions.append(row)
+        for size in range(2, len(actions) + 1):
+            window = list(actions)[-size:]
+            if window[-1]["game_ms"] - window[0]["game_ms"] <= 5000:
+                sequences[tuple(item["interaction_type"] for item in window)] += 1
+
     for row in rows:
-        grouped[(row["player_session_id"], row["round_id"])].append(row)
-    for sequence in grouped.values():
-        actions = [row for row in sequence if row["game_ms"] is not None]
-        for size in range(2, 9):
-            for index in range(len(actions) - size + 1):
-                window = actions[index:index + size]
-                if window[-1]["game_ms"] - window[0]["game_ms"] > 5000:
-                    continue
-                sequences[tuple(row["interaction_type"] for row in window)] += 1
-    return [{"motif": ">".join(key), "length": len(key), "occurrences": value} for key, value in sequences.most_common(50)]
+        flush_action(row)
+    ordered = sorted(sequences.items(), key=lambda item: (-item[1], item[0]))[:50]
+    return [{"motif": ">".join(key), "length": len(key), "occurrences": value} for key, value in ordered]
 
 
 def _trajectory_clusters(conn, start: str, end: str) -> list[dict]:
@@ -130,9 +138,11 @@ def scene_overview(conn, start: str, end: str) -> dict[str, Any]:
         """SELECT i.interaction_type,i.source_quality,i.player_session_id,i.x,i.y,e.name
            FROM scene_interactions i LEFT JOIN scene_entities e ON e.scene_entity_id=i.target_entity_id
            WHERE i.utc_timestamp>=? AND i.utc_timestamp<?""", (start, end)
-    ).fetchall()
+    )
     categories, types, heatmap, graph_edges, object_usage = Counter(), Counter(), Counter(), Counter(), Counter()
+    interaction_count = 0
     for row in interactions:
+        interaction_count += 1
         types[row["interaction_type"]] += 1
         category = object_category(row["name"])
         categories[category] += 1
@@ -153,7 +163,7 @@ def scene_overview(conn, start: str, end: str) -> dict[str, Any]:
     )}
     samples = conn.execute("SELECT COUNT(*) FROM scene_samples s JOIN events e ON e.event_id=s.event_id WHERE e.utc_timestamp>=? AND e.utc_timestamp<?", (start, end)).fetchone()[0]
     return {
-        "available": bool(interactions), "interactions_by_type": dict(types), "object_categories": dict(categories),
+        "available": bool(interaction_count), "interactions_by_type": dict(types), "object_categories": dict(categories),
         "interaction_heatmap": [{"x": x, "y": y, "count": count} for (x, y), count in heatmap.most_common(500)],
         "object_usage": [{"name": name, "category": category, "interactions": count} for (name, category), count in object_usage.most_common(50)],
         "interaction_graph": [{"from": source, "relation": relation, "to": target, "count": count} for (source, relation, target), count in graph_edges.most_common(100)],
