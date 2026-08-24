@@ -1,7 +1,7 @@
 // BotRotation 1.0.0 for Superfighters Deluxe 1.6.
 // Passive telemetry only: this script never changes players, objects, teams or rules.
 
-private const string SCRIPT_VERSION = "1.3.0";
+private const string SCRIPT_VERSION = "1.3.1";
 private const string SFD_BUILD = "24892602";
 // SFD shared-storage names must contain letters only and be at least 3 characters.
 private const string STORAGE_NAME = "CCC";
@@ -32,7 +32,9 @@ private const int SCENE_HIGHRES_RING_SAMPLES = 100;
 private const int SCENE_HIGHRES_BATCH_SAMPLES = 10;
 private const int OBJECT_DAMAGE_BATCH_SIZE = 25;
 private const float SCENE_NEAR_PLAYER_RADIUS = 200f;
-private const float SCENE_TRANSPORT_AVG_BYTES_PER_SECOND = 24576f;
+// Direct interactions are never throttled. The remaining dynamic-frame budget was
+// tuned against live health telemetry to keep the total scene stream near 1–2 GB/day.
+private const float SCENE_TRANSPORT_AVG_BYTES_PER_SECOND = 4500f;
 private const float SCENE_TRANSPORT_BURST_BYTES = 262144f;
 private static readonly bool ENABLE_CHAT = true;
 private static readonly bool ENABLE_INPUTS = true;
