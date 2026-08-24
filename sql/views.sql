@@ -56,4 +56,3 @@ SELECT attacker_session_id, victim_session_id,
 FROM combat_events
 WHERE attacker_session_id IS NOT NULL AND victim_session_id IS NOT NULL
 GROUP BY attacker_session_id, victim_session_id;
-

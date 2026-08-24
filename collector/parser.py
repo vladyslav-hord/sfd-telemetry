@@ -92,4 +92,3 @@ def unique_events(events: Iterable[ParsedEvent]) -> list[ParsedEvent]:
             seen.add(key)
             result.append(item)
     return result
-
