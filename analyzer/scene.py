@@ -91,19 +91,43 @@ def _motifs(conn, start: str, end: str) -> list[dict]:
            ORDER BY player_session_id,round_id,game_ms""",
         (start, end),
     ).fetchall()
-    sequences: Counter[tuple[str, str, str]] = Counter()
-    for first, second in zip(rows, rows[1:]):
-        if first["player_session_id"] != second["player_session_id"] or first["round_id"] != second["round_id"]:
+    sequences: Counter[tuple[str, ...]] = Counter()
+    grouped: dict[tuple[str, str], list] = defaultdict(list)
+    for row in rows:
+        grouped[(row["player_session_id"], row["round_id"])].append(row)
+    for sequence in grouped.values():
+        actions = [row for row in sequence if row["game_ms"] is not None]
+        for size in range(2, 9):
+            for index in range(len(actions) - size + 1):
+                window = actions[index:index + size]
+                if window[-1]["game_ms"] - window[0]["game_ms"] > 5000:
+                    continue
+                sequences[tuple(row["interaction_type"] for row in window)] += 1
+    return [{"motif": ">".join(key), "length": len(key), "occurrences": value} for key, value in sequences.most_common(50)]
+
+
+def _trajectory_clusters(conn, start: str, end: str) -> list[dict]:
+    """Deterministic coarse trajectory clusters are stable across runs and need no ML dependency."""
+    rows = conn.execute(
+        """SELECT s.velocity_x,s.velocity_y,s.is_missile,e.name
+           FROM scene_samples s JOIN events ev ON ev.event_id=s.event_id
+           JOIN scene_entities e ON e.scene_entity_id=s.scene_entity_id
+           WHERE ev.utc_timestamp>=? AND ev.utc_timestamp<?""", (start, end)
+    )
+    clusters: Counter[tuple[str, int, int, bool]] = Counter()
+    for row in rows:
+        vx, vy = float(row["velocity_x"] or 0), float(row["velocity_y"] or 0)
+        speed = math.hypot(vx, vy)
+        if speed < .5:
             continue
-        if first["game_ms"] is None or second["game_ms"] is None or second["game_ms"] - first["game_ms"] > 3000:
-            continue
-        sequences[(first["interaction_type"], second["interaction_type"], str(first["target_entity_id"] == second["target_entity_id"]))] += 1
-    return [{"motif": ">".join(key[:2]), "same_target": key[2] == "True", "occurrences": value} for key, value in sequences.most_common(50)]
+        direction = int((math.atan2(vy, vx) + math.pi) / (math.pi / 4)) % 8
+        clusters[(object_category(row["name"]), int(speed // 2), direction, bool(row["is_missile"]))] += 1
+    return [{"object_category": category, "speed_bucket": bucket, "direction_octant": direction, "is_missile": missile, "samples": count} for (category, bucket, direction, missile), count in clusters.most_common(50)]
 
 
 def scene_overview(conn, start: str, end: str) -> dict[str, Any]:
     interactions = conn.execute(
-        """SELECT i.interaction_type,i.source_quality,i.x,i.y,e.name
+        """SELECT i.interaction_type,i.source_quality,i.player_session_id,i.x,i.y,e.name
            FROM scene_interactions i LEFT JOIN scene_entities e ON e.scene_entity_id=i.target_entity_id
            WHERE i.utc_timestamp>=? AND i.utc_timestamp<?""", (start, end)
     ).fetchall()
@@ -135,7 +159,7 @@ def scene_overview(conn, start: str, end: str) -> dict[str, Any]:
         "interaction_graph": [{"from": source, "relation": relation, "to": target, "count": count} for (source, relation, target), count in graph_edges.most_common(100)],
         "lifecycle": lifecycle, "scene_samples": samples,
         "environmental_damage": sum(count for kind, count in types.items() if kind in {"object_damage_player", "object_damage_explosion", "object_impact_object"}),
-        "barrel_boost_candidates": barrels, "motifs": _motifs(conn, start, end), "episodes": episodes,
+        "barrel_boost_candidates": barrels, "motifs": _motifs(conn, start, end), "trajectory_clusters": _trajectory_clusters(conn, start, end), "episodes": episodes,
     }
 
 
