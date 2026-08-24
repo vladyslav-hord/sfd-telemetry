@@ -300,6 +300,7 @@ CREATE INDEX IF NOT EXISTS idx_rounds_map_time ON rounds(map_name, started_at);
 CREATE INDEX IF NOT EXISTS idx_chat_sender_time ON chat_messages(player_session_id, utc_timestamp);
 CREATE INDEX IF NOT EXISTS idx_network_player_time ON network_samples(player_session_id, utc_timestamp);
 CREATE INDEX IF NOT EXISTS idx_state_player_time ON state_samples(player_session_id, game_ms);
+CREATE INDEX IF NOT EXISTS idx_state_round_time ON state_samples(round_id, game_ms);
 CREATE INDEX IF NOT EXISTS idx_state_windows_player_time ON state_windows(player_session_id, utc_timestamp);
 CREATE INDEX IF NOT EXISTS idx_combat_hit_details_victim ON combat_hit_details(victim_session_id);
 CREATE INDEX IF NOT EXISTS idx_scene_entities_round ON scene_entities(round_id, entity_kind, engine_id);

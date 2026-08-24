@@ -20,6 +20,11 @@ py -3 -m analyzer.main export --date 2026-08-24
 py -3 -m analyzer.main validate
 ```
 
+`dashboard --episode <source-event-id>` rebuilds one local scene replay page.
+The regular `dashboard`, `daily` and `hourly` commands rebuild the pages linked
+from the selected daily report. The replay is a sampled reconstruction, not a
+physics-authoritative recording.
+
 `OPENAI_API_KEY` is optional. Without it, deterministic metrics and JSON reports still complete with `llm=disabled`. Raw chat is never written into daily JSON. Public names/chat are queued only when OpenAI is enabled; persistent identifiers, profiles and IP data are never sent.
 
 With `OPENAI_API_KEY`, queued chat work is uploaded as a JSONL Batch for `/v1/responses`; `sync-llm` imports completed output on the next run. API failures leave the deterministic report complete and the LLM status `partial`.
@@ -35,5 +40,9 @@ The batch launcher records output in `data/analysis/analyzer.log`. A non-zero ex
 The analyzer never reads `ConnectionIP` and never sends `player_identity_id`, AccountID, UserID, profiles or the telemetry database to OpenAI. If OpenAI is enabled it sends only public chat/name fields allowed by config and aggregate daily metrics. Set `send_public_names` to `false` to omit names.
 
 Batch requests use the pinned `gpt-5-nano-2025-08-07` model, `store=false`, minimal reasoning and a durable request hash. Token limits in config defer excess work; they do not delete it. `omni-moderation-latest` labels chat only for analytics priority and never kicks, bans or changes gameplay.
+
+High-coverage anomalous movement and scene candidates can be queued as compact
+`gameplay_pattern_v1` requests. They contain only derived features, source
+event IDs and the local candidate window—never the full telemetry database.
 
 Telemetry limitations are reflected in reports: packet loss is unavailable, jitter is estimated, team chat/whispers are unavailable, identities are host-scoped, and killer/assist/round result may be unknown or inferred. Pattern candidates are observations only, never evidence of cheating or misconduct.

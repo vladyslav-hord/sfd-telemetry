@@ -5,9 +5,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from analyzer.metrics import infer_death_attribution, percentile, ping_metrics, stat_deltas
+from analyzer.scene import _barrel_candidates, load_episode, object_category
 from analyzer.features import movement_features
 from analyzer.config import Config
 from analyzer.main import analyze_day
+from analyzer.dashboard import _episode_page
+from analyzer.llm import valid_gameplay
 from analyzer.report import validate_report
 
 
@@ -55,6 +58,40 @@ class MetricsTests(unittest.TestCase):
         other_round = [{"event_id": 2, "utc_timestamp": "2026-08-01T00:00:09Z", "round_id": "else", "victim_session_id": "victim", "attacker_session_id": "a", "damage": 100}]
         self.assertEqual(infer_death_attribution(death, stale), (None, "unattributed", []))
         self.assertEqual(infer_death_attribution(death, other_round), (None, "unattributed", []))
+
+    def test_scene_category_and_barrel_detector_requires_both_trajectories(self):
+        self.assertEqual(object_category("OilBarrel01"), "barrel")
+        with sqlite3.connect(":memory:") as conn:
+            conn.row_factory = sqlite3.Row
+            conn.executescript("""
+                CREATE TABLE scene_interactions(scene_interaction_id INTEGER,event_id INTEGER,round_id TEXT,game_ms REAL,player_session_id TEXT,target_entity_id INTEGER,interaction_type TEXT,utc_timestamp TEXT);
+                CREATE TABLE scene_entities(scene_entity_id INTEGER,name TEXT);
+                CREATE TABLE scene_samples(scene_entity_id INTEGER,round_id TEXT,game_ms REAL,velocity_x REAL,velocity_y REAL,x REAL,y REAL);
+                CREATE TABLE state_samples(player_session_id TEXT,round_id TEXT,game_ms REAL,velocity_x REAL,velocity_y REAL,x REAL,y REAL);
+            """)
+            conn.execute("INSERT INTO scene_entities VALUES(1,'OilBarrel01')")
+            conn.execute("INSERT INTO scene_interactions VALUES(1,10,'r',1000,'p',1,'player_kick_object','2026-08-01T00:00:01Z')")
+            conn.executemany("INSERT INTO scene_samples VALUES(?,?,?,?,?,?,?)", [(1,'r',950,0,0,0,0),(1,'r',1050,3,0,1,0)])
+            conn.executemany("INSERT INTO state_samples VALUES(?,?,?,?,?,?,?)", [('p','r',950,0,0,0,0),('p','r',1500,3,0,2,0)])
+            result = _barrel_candidates(conn, "2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z")
+        self.assertEqual(result[0]["confidence"], "high")
+
+    def test_scene_episode_missing_is_none(self):
+        with sqlite3.connect(":memory:") as conn:
+            conn.execute("CREATE TABLE scene_windows(source_event_id INTEGER,round_id TEXT,trigger_game_ms REAL,trigger TEXT,coverage REAL,entities_json TEXT)")
+            conn.execute("CREATE TABLE events(event_id INTEGER,utc_timestamp TEXT)")
+            self.assertIsNone(load_episode(conn, 1))
+
+    def test_scene_replay_has_required_controls(self):
+        page = _episode_page({"trigger": "kick", "coverage": 1.0, "interactions": [], "limitations": [], "samples": [], "players": [], "entities": [], "trigger_game_ms": 0})
+        self.assertIn("data-layer='players'", page)
+        self.assertIn("data-layer='exact'", page)
+        self.assertIn("id='scrubber'", page)
+
+    def test_gameplay_schema_requires_matching_window(self):
+        value = {"window_id": "scene:42", "classification": "normal_play", "mechanic_family": "unknown", "novelty_score": .2, "advantage_observed": False, "advantage_description": "none", "observations": [], "known_pattern_id": None, "candidate_signature_features": [], "confidence": .8, "evidence_event_ids": [42], "should_create_candidate": False}
+        self.assertTrue(valid_gameplay(value, "scene:42"))
+        self.assertFalse(valid_gameplay(value, "scene:43"))
 
 
 class DailyIntegrationTests(unittest.TestCase):

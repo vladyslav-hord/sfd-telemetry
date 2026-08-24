@@ -43,7 +43,8 @@ def detect_windows(rows: list[dict], z_threshold: float, min_coverage: float) ->
             from sklearn.ensemble import IsolationForest
             model = IsolationForest(contamination=.01, random_state=0)
             matrix = [[row["features"].get(key, 0.0) for key in ("distance", "mean_speed", "max_speed", "max_acceleration", "direction_switches")] for row in rows]
-            isolation = [prediction == -1 for prediction in model.fit_predict(matrix)]
+            # numpy.bool_ is not JSON serializable and reports must remain pure JSON.
+            isolation = [bool(prediction == -1) for prediction in model.fit_predict(matrix)]
         except (ImportError, ValueError):
             pass
     for index, row in enumerate(rows):

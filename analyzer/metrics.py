@@ -8,6 +8,7 @@ import json
 
 from .features import movement_features, state_durations
 from .patterns import detect_windows
+from .scene import scene_overview
 
 
 STAT_KEYS = ("TotalBlockedAttacks", "TotalDamageTaken", "TotalDives", "TotalEmptyGunsFireAttempts", "TotalExplosionDamageTaken", "TotalFallDamageTaken", "TotalFireDamageTaken", "TotalGrabbedPlayers", "TotalGrabCharges", "TotalItemsThrown", "TotalJumps", "TotalKickHits", "TotalKickSwings", "TotalMeleeAttackHits", "TotalMeleeAttackSwings", "TotalMeleeDamageTaken", "TotalOtherDamageTaken", "TotalPlayersThrown", "TotalProjectileDamageTaken", "TotalProjectilesHitBy", "TotalReloads", "TotalRolls", "TotalShotsFired")
@@ -330,6 +331,7 @@ def aggregate_day(conn, start: str, end: str, include_bots: bool, static_speed_t
     combat, pairs, weapons = combat_metrics(conn, start, end)
     round_rows = round_metric_rows(conn, start, end)
     server = {"sessions": len(sessions), "rounds": len(rounds), "events_by_type": {r[0]: r[1] for r in events}, "humans": sum(not r["is_bot"] for r in sessions), "bots": sum(bool(r["is_bot"]) for r in sessions), "data_quality": quality, "retention": retention_metrics(conn, start, end), "combat": {"damage": sum(x["damage_dealt"] for x in combat.values()), "inferred_kills": sum(x["inferred_kill_credit"] for x in combat.values()), "inferred_kills_high_confidence": sum(x["inferred_kill_high_confidence"] for x in combat.values()), "inferred_kills_medium_confidence": sum(x["inferred_kill_medium_confidence"] for x in combat.values()), "unattributed_deaths": sum(x["unattributed_death"] for x in combat.values())}}
+    server["environment"] = scene_overview(conn, start, end)
     player_rows = []
     grouped = defaultdict(list)
     for row in sessions:

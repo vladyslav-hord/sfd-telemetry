@@ -29,6 +29,13 @@ open_dashboard.bat
 
 The dashboard is static and local. Scene replay data becomes available only for
 rounds collected after script version 1.2.0 is applied in Server Tool.
+Version 1.2.3 also records bounded 4 Hz trajectories for active projectiles;
+object and player data remain adaptive to keep the telemetry budget bounded.
+
+Scene pages are written under `data\dashboard\episodes`. They provide a local
+canvas replay with scrubber, play speeds and independent layers for players,
+objects, projectiles and exact/derived interactions. Old reports explicitly
+show scene telemetry as unavailable rather than fabricating historical data.
 
 ## Verify
 

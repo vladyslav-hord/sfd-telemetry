@@ -7,7 +7,7 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 
-from .prompts import CHAT_PROMPT, CHAT_PROMPT_VERSION, CHAT_SCHEMA, NARRATIVE_PROMPT, NARRATIVE_PROMPT_VERSION, NARRATIVE_SCHEMA
+from .prompts import CHAT_PROMPT, CHAT_PROMPT_VERSION, CHAT_SCHEMA, GAMEPLAY_PROMPT, GAMEPLAY_PROMPT_VERSION, GAMEPLAY_SCHEMA, NARRATIVE_PROMPT, NARRATIVE_PROMPT_VERSION, NARRATIVE_SCHEMA
 
 
 def request_hash(source_type: str, source_id: str, prompt_version: str, model: str, payload: dict) -> str:
@@ -95,6 +95,23 @@ def queue_narrative_request(analytics, report_date: str, aggregates: dict, confi
     return cursor.rowcount
 
 
+def queue_gameplay_requests(analytics, report_date: str, windows: list[dict], config) -> int:
+    """Queue compact high-coverage candidates only; raw matches and full telemetry never leave SQLite."""
+    if not config.openai_enabled or not os.getenv("OPENAI_API_KEY"):
+        return 0
+    now, queued = datetime.now(timezone.utc).isoformat(), 0
+    eligible = [item for item in windows if item.get("coverage", item.get("features", {}).get("coverage", 0)) >= config.anomaly_min_sample_coverage]
+    eligible.sort(key=lambda item: abs(item.get("robust_z") or 0), reverse=True)
+    for item in eligible[:config.max_llm_anomaly_windows_per_day]:
+        source_id = str(item["source_window_id"])
+        payload = {"report_date": report_date, "window": {key: value for key, value in item.items() if key not in {"player_identity_id", "display_name"}}}
+        key = request_hash("gameplay", source_id, GAMEPLAY_PROMPT_VERSION, config.openai_model, payload)
+        cursor = analytics.execute("INSERT OR IGNORE INTO llm_requests(request_hash,source_type,source_id,prompt_version,model,status,request_json,created_at,updated_at) VALUES(?,?,?,?,?,'queued',?,?,?)", (key, "gameplay", source_id, GAMEPLAY_PROMPT_VERSION, config.openai_model, json.dumps(payload, ensure_ascii=False), now, now))
+        queued += cursor.rowcount
+    analytics.commit()
+    return queued
+
+
 def submit_pending_batches(analytics, config) -> str:
     if not config.openai_enabled or not os.getenv("OPENAI_API_KEY"):
         return "disabled"
@@ -105,8 +122,12 @@ def submit_pending_batches(analytics, config) -> str:
         from openai import OpenAI
         lines = []
         for row in rows:
-            is_chat = row["source_type"] == "chat"
-            prompt, schema, name = (CHAT_PROMPT, CHAT_SCHEMA, "chat_annotations") if is_chat else (NARRATIVE_PROMPT, NARRATIVE_SCHEMA, "daily_narrative")
+            if row["source_type"] == "chat":
+                prompt, schema, name = CHAT_PROMPT, CHAT_SCHEMA, "chat_annotations"
+            elif row["source_type"] == "gameplay":
+                prompt, schema, name = GAMEPLAY_PROMPT, GAMEPLAY_SCHEMA, "gameplay_pattern"
+            else:
+                prompt, schema, name = NARRATIVE_PROMPT, NARRATIVE_SCHEMA, "daily_narrative"
             content = row["request_json"]
             body = {"model": config.openai_model, "store": False, "reasoning": {"effort": config.openai_reasoning_effort}, "input": [{"role": "developer", "content": prompt}, {"role": "user", "content": content}], "text": {"format": {"type": "json_schema", "name": name, "strict": True, "schema": schema}}}
             lines.append(json.dumps({"custom_id": row["request_hash"], "method": "POST", "url": "/v1/responses", "body": body}, ensure_ascii=False))
@@ -170,6 +191,8 @@ def sync_batches(analytics, report_directory: str | None = None) -> int:
                                 from .report import write_report
                                 write_report(report_directory, request["source_id"], data)
                         analytics.execute("UPDATE llm_requests SET status='complete',response_json=?,updated_at=? WHERE request_hash=?", (json.dumps(result, ensure_ascii=False), datetime.now(timezone.utc).isoformat(), key)); imported += 1
+                    elif request["source_type"] == "gameplay" and (gameplay := extract_json(result)) is not None and valid_gameplay(gameplay, request["source_id"]):
+                        analytics.execute("UPDATE llm_requests SET status='complete',response_json=?,updated_at=? WHERE request_hash=?", (json.dumps(result, ensure_ascii=False), datetime.now(timezone.utc).isoformat(), key)); imported += 1
                     else:
                         status = "queued" if request["attempts"] < 3 else "malformed"
                         analytics.execute("UPDATE llm_requests SET status=?,response_json=?,updated_at=? WHERE request_hash=?", (status, json.dumps(result, ensure_ascii=False), datetime.now(timezone.utc).isoformat(), key))
@@ -221,3 +244,8 @@ def valid_chat_annotations(values: list[dict], expected_ids: set[int]) -> bool:
 def valid_narrative(value: dict) -> bool:
     keys = {"headline", "server_health", "player_experience", "map_findings", "network_findings", "player_highlights", "pattern_findings", "chat_findings", "possible_factors", "limitations"}
     return set(value) == keys and isinstance(value["headline"], str) and all(isinstance(value[key], list) and all(isinstance(item, str) for item in value[key]) for key in keys - {"headline"})
+
+
+def valid_gameplay(value: dict, expected_window_id: str) -> bool:
+    required = {"window_id", "classification", "mechanic_family", "novelty_score", "advantage_observed", "advantage_description", "observations", "known_pattern_id", "candidate_signature_features", "confidence", "evidence_event_ids", "should_create_candidate"}
+    return set(value) == required and value.get("window_id") == expected_window_id and 0 <= float(value["confidence"]) <= 1 and 0 <= float(value["novelty_score"]) <= 1 and isinstance(value["observations"], list) and isinstance(value["evidence_event_ids"], list)

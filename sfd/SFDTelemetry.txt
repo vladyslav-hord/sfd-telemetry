@@ -1,7 +1,7 @@
 // BotRotation 1.0.0 for Superfighters Deluxe 1.6.
 // Passive telemetry only: this script never changes players, objects, teams or rules.
 
-private const string SCRIPT_VERSION = "1.2.2";
+private const string SCRIPT_VERSION = "1.2.3";
 private const string SFD_BUILD = "24892602";
 // SFD shared-storage names must contain letters only and be at least 3 characters.
 private const string STORAGE_NAME = "CCC";
@@ -24,6 +24,7 @@ private const int SCENE_WINDOW_COOLDOWN_MS = 500;
 private const int MAX_TRACKED_OBJECTS = 512;
 private const int MAX_HIGHRES_OBJECTS = 64;
 private const int MAX_SCENE_FRAME_OBJECTS = 16;
+private const int MAX_PROJECTILE_FRAME_SAMPLES = 8;
 private const int MAX_SCENE_WINDOW_OBJECTS = 8;
 private const int MAX_HIGHRES_WINDOW_SAMPLES = 50;
 private const float SCENE_NEAR_PLAYER_RADIUS = 200f;
@@ -459,6 +460,19 @@ private void SampleSceneDynamics(float now)
         changed.Append(']');
         QueueEvent("scene_frame_batch", "", ObjectJson(Field("entities", changed.ToString())));
     }
+    // Projectile callbacks are exact contacts; these short 4 Hz trajectories supply
+    // the motion context between create and hit without polling the whole world at 20 Hz.
+    IProjectile[] projectiles = Game.GetProjectiles();
+    StringBuilder projectileFrames = new StringBuilder("[");
+    int projectileCount = Math.Min(projectiles.Length, MAX_PROJECTILE_FRAME_SAMPLES);
+    for (int i = 0; i < projectileCount; i++)
+    {
+        if (i > 0) projectileFrames.Append(',');
+        projectileFrames.Append(ProjectileJson(projectiles[i]));
+    }
+    projectileFrames.Append(']');
+    if (projectileCount > 0)
+        QueueEvent("scene_frame_batch", "", ObjectJson(Field("entities", projectileFrames.ToString())));
 }
 
 private void QueueSceneWindow(string trigger)

@@ -12,13 +12,13 @@ from zoneinfo import ZoneInfo
 
 from .config import load_config
 from .dashboard import build_dashboard
-from .llm import queue_chat_requests, queue_narrative_request, reconcile_chat_annotations, submit_pending_batches, sync_batches
+from .llm import queue_chat_requests, queue_gameplay_requests, queue_narrative_request, reconcile_chat_annotations, submit_pending_batches, sync_batches
 from .metrics import aggregate_day, day_bounds
 from .patterns import candidate_state
 from .report import base_report, validate_report, write_report
 from .storage import open_analytics, open_telemetry
 
-METRIC_VERSION = 3
+METRIC_VERSION = 4
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -112,16 +112,26 @@ def analyze_day(config, report_day: date, command: str = "daily") -> Path:
             source_window_id = item["source_window_id"]
             confidence = min(1.0, abs(item["robust_z"] or 0) / max(config.anomaly_robust_z_threshold, 1))
             analytics.execute("INSERT INTO pattern_matches(pattern_id,source_window_id,confidence,quality,created_at) VALUES(?,?,?,?,?) ON CONFLICT(pattern_id,source_window_id) DO UPDATE SET confidence=excluded.confidence,quality=excluded.quality", (pattern_id, source_window_id, confidence, "derived", generated))
+        scene_patterns = []
+        for item in server["environment"].get("barrel_boost_candidates", []):
+            if item["confidence"] not in {"high", "medium"}:
+                continue
+            scene_item = {**item, "signature": "scene_barrel_boost", "features": {"coverage": item["coverage"], "object_speed_gain": item["object_speed_gain"], "player_speed_gain": item["player_speed_gain"], "player_displacement": item["player_displacement"]}}
+            scene_patterns.append(scene_item)
+            analytics.execute("INSERT INTO pattern_catalog(pattern_id,state,metadata_json,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(pattern_id) DO UPDATE SET updated_at=excluded.updated_at", ("pattern_scene_barrel_boost", "candidate", json.dumps({"type": "object_assisted_movement", "subtype": "barrel_boost_candidate"}), generated, generated))
+            analytics.execute("INSERT INTO candidate_windows(window_id,report_date,source_window_id,features_json,coverage,status,created_at) VALUES(?,?,?,?,?,'candidate',?) ON CONFLICT(source_window_id) DO UPDATE SET features_json=excluded.features_json,coverage=excluded.coverage,status='candidate'", (report_day.isoformat() + ":" + item["source_window_id"], report_day.isoformat(), item["source_window_id"], json.dumps(scene_item, ensure_ascii=False), item["coverage"], generated))
+            analytics.execute("INSERT INTO pattern_matches(pattern_id,source_window_id,confidence,quality,created_at) VALUES(?,?,?,?,?) ON CONFLICT(pattern_id,source_window_id) DO UPDATE SET confidence=excluded.confidence,quality=excluded.quality", ("pattern_scene_barrel_boost", item["source_window_id"], 1.0 if item["confidence"] == "high" else .65, "derived", generated))
         queue_chat_requests(analytics, telemetry, start, end, config)
+        queue_gameplay_requests(analytics, report_day.isoformat(), [*windows, *scene_patterns], config)
         queue_narrative_request(analytics, report_day.isoformat(), {"server": server, "maps": maps, "network": {"sessions": network}, "weapons": weapons, "patterns": windows}, config)
         llm_status = submit_pending_batches(analytics, config)
-        payload = base_report(report_day.isoformat(), config.timezone, run_id, end, server, maps, players, weapons, network, llm_status, pairs, rounds, windows)
+        payload = base_report(report_day.isoformat(), config.timezone, run_id, end, server, maps, players, weapons, network, llm_status, pairs, rounds, [*windows, *scene_patterns])
         if prior_report:
             prior_payload = json.loads(prior_report["report_json"])
             if prior_payload.get("narrative"):
                 payload["narrative"] = prior_payload["narrative"]
         write_report(config.report_directory, report_day.isoformat(), payload)
-        build_dashboard(config.report_directory, report_day.isoformat())
+        build_dashboard(config.report_directory, report_day.isoformat(), config.telemetry_database)
         upsert(analytics, "daily_reports", ("report_date", "metric_version", "report_json", "llm_status", "generated_at", "analysis_run_id"), (report_day.isoformat(), METRIC_VERSION, json.dumps(payload, ensure_ascii=False), llm_status, generated, run_id))
         analytics.execute("UPDATE analysis_runs SET completed_at=?, status='complete' WHERE analysis_run_id=?", (datetime.now(timezone.utc).isoformat(), run_id))
         analytics.commit()
@@ -187,9 +197,7 @@ def main(argv: list[str] | None = None) -> int:
             finally: analytics.close()
             return 0
         if args.command == "dashboard":
-            if args.episode:
-                raise RuntimeError("Episode pages are generated from scene_window_complete telemetry during dashboard build")
-            print(build_dashboard(config.report_directory, args.date))
+            print(build_dashboard(config.report_directory, args.date, config.telemetry_database, int(args.episode) if args.episode else None))
             return 0
         if args.command == "submit-llm":
             analytics = open_analytics(config.analytics_database, ROOT / "analyzer" / "schema.sql")
