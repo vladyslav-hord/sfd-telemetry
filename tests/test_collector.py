@@ -150,10 +150,11 @@ class DatabaseTests(unittest.TestCase):
             try:
                 manifest = parse_telemetry_line(event(1, "scene_manifest_batch", None, {"entities": [{"kind": "object", "object_id": 44, "name": "Barrel", "x": 1, "y": 2}]}))
                 frame = parse_telemetry_line(event(2, "scene_frame_batch", None, {"entities": [{"kind": "object", "object_id": 44, "x": 3, "y": 2, "vx": 4, "vy": 0, "game_ms": 20}]}))
-                melee = parse_telemetry_line(event(3, "melee_action", "p", {"attacker_session_id": "p", "action": "kick", "hits": [{"object_id": 44, "is_player": False, "damage": 4, "x": 3, "y": 2}]}))
-                self.assertEqual(db.insert_batch([manifest, frame, melee]), (3, 0))
-                self.assertEqual(db.connection.execute("SELECT COUNT(*) FROM scene_chunks").fetchone()[0], 2)
-                self.assertEqual(db.connection.execute("SELECT COUNT(*) FROM scene_samples").fetchone()[0], 1)
+                highres = parse_telemetry_line(event(3, "scene_highres_batch", None, {"entities": [{"kind": "object", "object_id": 44, "x": 2, "y": 2, "vx": 3, "vy": 0, "game_ms": 15}]}))
+                melee = parse_telemetry_line(event(4, "melee_action", "p", {"attacker_session_id": "p", "action": "kick", "hits": [{"object_id": 44, "is_player": False, "damage": 4, "x": 3, "y": 2}]}))
+                self.assertEqual(db.insert_batch([manifest, frame, highres, melee]), (4, 0))
+                self.assertEqual(db.connection.execute("SELECT COUNT(*) FROM scene_chunks").fetchone()[0], 3)
+                self.assertEqual(db.connection.execute("SELECT COUNT(*) FROM scene_samples").fetchone()[0], 2)
                 self.assertEqual(tuple(db.connection.execute("SELECT interaction_type,source_quality FROM scene_interactions").fetchone()), ("player_kick_object", "exact"))
             finally:
                 db.close()

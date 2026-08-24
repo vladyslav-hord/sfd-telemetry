@@ -204,7 +204,7 @@ class TelemetryDB:
                  json.dumps(stats, ensure_ascii=False, separators=(",", ":")),
                  json.dumps(delta, ensure_ascii=False, separators=(",", ":")) if delta is not None else None),
             )
-        elif event_type in {"scene_manifest_batch", "scene_frame_batch"}:
+        elif event_type in {"scene_manifest_batch", "scene_frame_batch", "scene_highres_batch"}:
             self._store_scene_chunk(event_id, data)
             self._store_scene_batch(event_id, event_type, e, data)
         elif event_type == "scene_window_complete":
@@ -285,7 +285,7 @@ class TelemetryDB:
                 continue
             kind = item.get("kind", "object")
             entity_id = self._scene_entity(e, event_id, kind, item.get("object_id", item.get("instance_id")), item)
-            if entity_id is None or event_type != "scene_frame_batch":
+            if entity_id is None or event_type not in {"scene_frame_batch", "scene_highres_batch"}:
                 continue
             self.connection.execute(
                 """INSERT OR IGNORE INTO scene_samples(scene_entity_id,event_id,round_id,game_ms,x,y,velocity_x,velocity_y,angle,angular_velocity,health,max_health,is_missile,state_json)
