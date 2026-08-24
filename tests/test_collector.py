@@ -174,6 +174,20 @@ class DatabaseTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_object_damage_batch_preserves_each_direct_interaction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db = TelemetryDB(Path(directory) / "damage-batch.sqlite3", ROOT / "sql/schema.sql", ROOT / "sql/views.sql")
+            try:
+                batch = parse_telemetry_line(event(1, "object_damage_batch", None, {"records": [
+                    {"object": {"object_id": 44, "name": "Barrel"}, "damage": 8, "damage_type": "Melee", "source_is_player": True, "source_player_session_id": "a", "game_ms": 10},
+                    {"object": {"object_id": 45, "name": "Crate"}, "damage": 4, "damage_type": "Projectile", "source_id": 77, "game_ms": 20},
+                ]}))
+                self.assertEqual(db.insert_batch([batch]), (1, 0))
+                rows = db.connection.execute("SELECT interaction_type,player_session_id,game_ms FROM scene_interactions ORDER BY game_ms").fetchall()
+                self.assertEqual([tuple(row) for row in rows], [("object_damage_player", "a", 10), ("object_damage_projectile", None, 20)])
+            finally:
+                db.close()
+
 
 class CollectorTests(unittest.TestCase):
     def test_snapshot_replacement_restart_dedupe_and_gap(self) -> None:

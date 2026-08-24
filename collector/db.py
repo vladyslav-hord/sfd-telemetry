@@ -220,10 +220,11 @@ class TelemetryDB:
             if entity_id is not None and event_type == "object_terminated":
                 self.connection.execute("UPDATE scene_entities SET terminated_event_id=? WHERE scene_entity_id=?", (event_id, entity_id))
             if event_type == "object_damage":
-                interaction_type = self._object_damage_type(data)
-                source_kind = "projectile" if interaction_type == "object_damage_projectile" else "object"
-                actor_id = None if data.get("source_is_player") else self._scene_entity(e, event_id, source_kind, data.get("source_id"), {})
-                self._insert_scene_interaction(event_id, e, interaction_type, "exact", data.get("source_player_session_id") or e.get("player"), actor_id, entity_id, None, data)
+                self._store_object_damage(event_id, e, data)
+        elif event_type == "object_damage_batch":
+            for record in data.get("records", []):
+                if isinstance(record, dict):
+                    self._store_object_damage(event_id, e, record)
         elif event_type == "melee_action":
             self._store_combat_event(event_id, event_type, data, e)
             for hit in data.get("hits", []):
@@ -301,6 +302,17 @@ class TelemetryDB:
         if "projectile" in value:
             return "object_damage_projectile"
         return "object_damage_player" if data.get("source_is_player") else "object_impact_object"
+
+    def _store_object_damage(self, event_id: int, e: dict[str, Any], data: dict[str, Any]) -> None:
+        snapshot = data.get("object") if isinstance(data.get("object"), dict) else data
+        entity_id = self._scene_entity(e, event_id, "object", snapshot.get("object_id"), snapshot)
+        if entity_id is None:
+            return
+        interaction_type = self._object_damage_type(data)
+        source_kind = "projectile" if interaction_type == "object_damage_projectile" else "object"
+        actor_id = None if data.get("source_is_player") else self._scene_entity(e, event_id, source_kind, data.get("source_id"), {})
+        event = {**e, "game_ms": data.get("game_ms", e.get("game_ms"))}
+        self._insert_scene_interaction(event_id, event, interaction_type, "exact", data.get("source_player_session_id") or e.get("player"), actor_id, entity_id, None, data)
 
     def _insert_scene_interaction(self, event_id: int, e: dict[str, Any], interaction_type: str, quality: str, player_id: str | None, actor_id: int | None, target_id: int | None, target_player_id: str | None, details: dict[str, Any]) -> None:
         self.connection.execute(

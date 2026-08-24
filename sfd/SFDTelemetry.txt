@@ -1,7 +1,7 @@
 // BotRotation 1.0.0 for Superfighters Deluxe 1.6.
 // Passive telemetry only: this script never changes players, objects, teams or rules.
 
-private const string SCRIPT_VERSION = "1.2.7";
+private const string SCRIPT_VERSION = "1.2.8";
 private const string SFD_BUILD = "24892602";
 // SFD shared-storage names must contain letters only and be at least 3 characters.
 private const string STORAGE_NAME = "CCC";
@@ -30,6 +30,7 @@ private const int MAX_SCENE_WINDOW_OBJECTS = 8;
 private const int MAX_HIGHRES_WINDOW_SAMPLES = 50;
 private const int SCENE_HIGHRES_RING_SAMPLES = 100;
 private const int SCENE_HIGHRES_BATCH_SAMPLES = 10;
+private const int OBJECT_DAMAGE_BATCH_SIZE = 10;
 private const float SCENE_NEAR_PLAYER_RADIUS = 200f;
 private const float SCENE_TRANSPORT_AVG_BYTES_PER_SECOND = 24576f;
 private const float SCENE_TRANSPORT_BURST_BYTES = 262144f;
@@ -71,6 +72,7 @@ private float m_lastSceneHealthMs;
 private IScriptStorage m_transport;
 private List<string> m_pending = new List<string>();
 private List<string> m_pendingTypes = new List<string>();
+private List<string> m_pendingObjectDamage = new List<string>();
 private Dictionary<string, List<StatePoint>> m_ring = new Dictionary<string, List<StatePoint>>();
 private Dictionary<string, float> m_lastHighresDump = new Dictionary<string, float>();
 private Dictionary<string, float> m_captureUntil = new Dictionary<string, float>();
@@ -191,6 +193,7 @@ public void OnStartup()
 
 public void OnShutdown()
 {
+    FlushObjectDamageBatches();
     SnapshotAllStatistics("round_end");
     EndRound("script_shutdown");
     QueueHealth();
@@ -243,6 +246,7 @@ private void OnTelemetryUpdate(float elapsed)
     if (now - m_lastFlushMs >= STORAGE_FLUSH_INTERVAL_MS)
     {
         m_lastFlushMs = now;
+        FlushObjectDamageBatches();
         FlushPending();
     }
 }
@@ -433,13 +437,30 @@ private void OnObjectDamage(IObject obj, ObjectDamageArgs args)
 {
     MarkSceneObject(obj.UniqueID);
     IPlayer sourcePlayer = args.IsPlayer ? Game.GetPlayer(args.SourceID) : null;
-    QueueEvent("object_damage", "", ObjectJson(
+    m_pendingObjectDamage.Add(ObjectJson(
         Field("object", SceneObjectJson(obj)),
         Field("damage", Number(args.Damage)), Field("damage_type", Quote(args.DamageType.ToString())),
         Field("source_id", args.SourceID.ToString()), Field("source_is_player", Bool(args.IsPlayer)),
         Field("source_player_session_id", Quote(SessionId(sourcePlayer))),
-        Field("health_after", Number(obj.GetHealth()))));
+        Field("health_after", Number(obj.GetHealth())), Field("game_ms", Number(Game.TotalElapsedGameTime))));
     QueueSceneWindow("object_damage", obj.UniqueID);
+}
+
+private void FlushObjectDamageBatches()
+{
+    while (m_pendingObjectDamage.Count > 0)
+    {
+        int count = Math.Min(OBJECT_DAMAGE_BATCH_SIZE, m_pendingObjectDamage.Count);
+        StringBuilder records = new StringBuilder("[");
+        for (int i = 0; i < count; i++)
+        {
+            if (i > 0) records.Append(',');
+            records.Append(m_pendingObjectDamage[i]);
+        }
+        records.Append(']');
+        m_pendingObjectDamage.RemoveRange(0, count);
+        QueueEvent("object_damage_batch", "", ObjectJson(Field("records", records.ToString())));
+    }
 }
 
 private void OnObjectTerminated(IObject[] objects)
@@ -1235,7 +1256,7 @@ private bool IsLowPrioritySceneEvent(string type)
 private bool IsSceneEvent(string type)
 {
     return type == "scene_manifest_batch" || type == "scene_frame_batch" || type == "scene_highres_batch" || type == "scene_window_complete" ||
-        type == "object_created" || type == "object_damage" || type == "object_terminated" ||
+        type == "object_created" || type == "object_damage" || type == "object_damage_batch" || type == "object_terminated" ||
         type == "projectile_created" || type == "projectile_hit" || type == "explosion_hit" || type == "melee_action";
 }
 
@@ -1266,7 +1287,7 @@ private bool IsCriticalEvent(string type)
 {
     return type == "player_damage" || type == "player_death" || type == "round_start" ||
         type == "round_end" || type == "user_join" || type == "user_leave" ||
-        type == "chat_message" || type == "object_created" || type == "object_damage" ||
+        type == "chat_message" || type == "object_created" || type == "object_damage" || type == "object_damage_batch" ||
         type == "object_terminated" || type == "projectile_created" || type == "projectile_hit" ||
         type == "explosion_hit" || type == "melee_action" || type == "scene_window_complete" || type == "scene_highres_batch";
 }
