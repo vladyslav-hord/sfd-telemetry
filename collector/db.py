@@ -222,7 +222,10 @@ class TelemetryDB:
             if event_type == "object_damage":
                 self._store_object_damage(event_id, e, data)
         elif event_type == "object_damage_batch":
-            for record in data.get("records", []):
+            records = data.get("records", [])
+            if data.get("field_map") == "object_damage_v1":
+                records = [self._object_damage_v1(record) for record in records if isinstance(record, list)]
+            for record in records:
                 if isinstance(record, dict):
                     self._store_object_damage(event_id, e, record)
         elif event_type == "melee_action":
@@ -313,6 +316,17 @@ class TelemetryDB:
         actor_id = None if data.get("source_is_player") else self._scene_entity(e, event_id, source_kind, data.get("source_id"), {})
         event = {**e, "game_ms": data.get("game_ms", e.get("game_ms"))}
         self._insert_scene_interaction(event_id, event, interaction_type, "exact", data.get("source_player_session_id") or e.get("player"), actor_id, entity_id, None, data)
+
+    @staticmethod
+    def _object_damage_v1(record: list[Any]) -> dict[str, Any]:
+        if len(record) != 14:
+            return {}
+        return {
+            "object_id": record[0], "x": record[1], "y": record[2], "vx": record[3], "vy": record[4],
+            "health": record[5], "max_health": record[6], "is_missile": record[7], "damage": record[8],
+            "damage_type": record[9], "source_id": record[10], "source_is_player": record[11],
+            "source_player_session_id": record[12], "game_ms": record[13],
+        }
 
     def _insert_scene_interaction(self, event_id: int, e: dict[str, Any], interaction_type: str, quality: str, player_id: str | None, actor_id: int | None, target_id: int | None, target_player_id: str | None, details: dict[str, Any]) -> None:
         self.connection.execute(
